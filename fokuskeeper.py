@@ -470,7 +470,24 @@ def get_chrome_active_tab_url():
     )
     if result.returncode == 0:
         return result.stdout.strip()
+    _warn_chrome_access_once(result.stderr.strip())
     return ""
+
+_chrome_access_warned = False
+
+def _warn_chrome_access_once(stderr_text):
+    """Log the first Chrome-osascript failure so web gating never dies silently.
+
+    The classic cause is a missing per-app Automation grant (TCC error -1743)
+    for whatever process launched the daemon — without this line the web
+    surface just stops working with no trace.
+    """
+    global _chrome_access_warned
+    if _chrome_access_warned:
+        return
+    _chrome_access_warned = True
+    log(f"WARNING: cannot read Chrome tabs - web gating inactive ({stderr_text or 'unknown osascript error'}). "
+        "Grant Automation permission for Google Chrome to the app that starts FokusKeeper.")
 
 def get_chrome_front_tab_ref():
     """Identify the front Chrome window and its active tab by ID.
