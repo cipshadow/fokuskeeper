@@ -967,8 +967,10 @@ def _today_counters(state):
         opens = validate_counter(state.get(f"{key}_opens", 0))
         prevented = state.get(f"{key}_prevented")
         if prevented is None:
-            # Legacy state files only carried the shared total.
-            prevented = state.get("distractions_prevented", 0)
+            # Legacy state files only carried the shared total, and legacy
+            # events were Slack-only (see _bucket_event_type) — falling back
+            # for every target would multiply the shared total per target.
+            prevented = state.get("distractions_prevented", 0) if key == "slack" else 0
         counters[key] = (opens, validate_counter(prevented))
     return counters
 

@@ -639,6 +639,21 @@ class TestChromeTabRefValidation:
 class TestCliAllTargets(_TempCliMixin):
     """CLI stats iterates every configured target."""
 
+    def test_legacy_shared_prevented_falls_back_to_slack_only(self):
+        # Regression: the shared legacy total must not be repeated for every
+        # target lacking its own {key}_prevented — that multiplied it by ten.
+        state = {
+            "stats_date": sg.get_today_date(),
+            "whatsapp_prevented": 2,
+            "distractions_prevented": 20,
+        }
+        counters = sg._today_counters(state)
+        assert counters["slack"] == (0, 20)      # legacy events were Slack-only
+        assert counters["whatsapp"] == (0, 2)    # own key wins
+        assert counters["reddit"] == (0, 0)      # no fallback for the rest
+        total_prevented = sum(p for _, p in counters.values())
+        assert total_prevented == 22
+
     def test_stats_lists_all_ten_targets(self, capsys):
         self._run_main(["stats"])
         out = capsys.readouterr().out
