@@ -1,41 +1,51 @@
 #!/bin/bash
-# Slack Gatekeeper - Installation Script
-# Run this after syncing to a new machine
+# FokusKeeper - Installation Script
+# Usage: ./install.sh [--with-control-panel]
 
-set -e  # Exit on error
+set -e
 
-echo "🚪 Distraction Gatekeeper - Installation"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "FokusKeeper - Installation"
+echo "=========================="
 echo ""
 
+# Guard: python3 must exist
+if ! command -v python3 > /dev/null 2>&1; then
+    echo "python3 was not found on this machine."
+    echo "Install the Xcode Command Line Tools (run: xcode-select --install)"
+    echo "or install Python via Homebrew (brew install python)."
+    exit 1
+fi
+
 # Detect installation directory
-INSTALL_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-echo "📁 Installation directory: $INSTALL_DIR"
+INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "Installation directory: $INSTALL_DIR"
 echo ""
 
 # Step 1: Make scripts executable
-echo "1️⃣  Making scripts executable..."
-chmod +x "$INSTALL_DIR/slack_gatekeeper.py"
-chmod +x "$INSTALL_DIR/gatekeeper"
-echo "   ✅ Scripts are executable"
+echo "[1/4] Making scripts executable..."
+chmod +x "$INSTALL_DIR/fokuskeeper.py"
+chmod +x "$INSTALL_DIR/fokuskeeper"
+chmod +x "$INSTALL_DIR/start-menubar.sh"
+echo "      Done."
 echo ""
 
 # Step 2: Create auto-start app
-echo "2️⃣  Creating auto-start app..."
-APP_PATH="$HOME/Applications/StartGatekeeper.app"
+echo "[2/4] Creating login launcher app..."
+APP_PATH="$HOME/Applications/FokusKeeper.app"
 mkdir -p "$APP_PATH/Contents/MacOS"
 
-# Create startup script
 cat > "$APP_PATH/Contents/MacOS/run" << EOF
 #!/bin/bash
 cd "$INSTALL_DIR"
-python3 slack_gatekeeper.py > ~/Library/Logs/gatekeeper.log 2>&1 &
-
+if [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+    PY="$INSTALL_DIR/.venv/bin/python3"
+else
+    PY="python3"
+fi
+exec "\$PY" fokuskeeper.py run >> "\$HOME/Library/Logs/fokuskeeper-stdout.log" 2>&1
 EOF
-
 chmod +x "$APP_PATH/Contents/MacOS/run"
 
-# Create Info.plist
 cat > "$APP_PATH/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -44,9 +54,9 @@ cat > "$APP_PATH/Contents/Info.plist" << 'EOF'
     <key>CFBundleExecutable</key>
     <string>run</string>
     <key>CFBundleName</key>
-    <string>StartGatekeeper</string>
+    <string>FokusKeeper</string>
     <key>CFBundleIdentifier</key>
-    <string>local.startgatekeeper</string>
+    <string>local.fokuskeeper</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
@@ -56,134 +66,66 @@ cat > "$APP_PATH/Contents/Info.plist" << 'EOF'
 </dict>
 </plist>
 EOF
-
-echo "   ✅ Created: $APP_PATH"
+echo "      Created: $APP_PATH"
 echo ""
 
-# Step 3: Copy control panel to Desktop
-echo "3️⃣  Setting up Desktop control panel..."
-cat > "$HOME/Desktop/GATEKEEPER.command" << EOF
+# Step 3: Optional Desktop control panel
+if [ "$1" = "--with-control-panel" ]; then
+    echo "[3/4] Writing Desktop control panel..."
+    cat > "$HOME/Desktop/FOKUSKEEPER.command" << EOF
 #!/bin/bash
-# Distraction Gatekeeper Control Panel (Slack + Gmail)
+# FokusKeeper control panel — thin wrapper around the fokuskeeper CLI.
+FK="$INSTALL_DIR/fokuskeeper"
 
-cd "$INSTALL_DIR"
-
-# Check if running
-is_running() {
-    pgrep -f slack_gatekeeper.py > /dev/null
-}
-
-# Get counts
-get_counts() {
-    python3 << 'PYEOF'
-import json
-import os
-from datetime import datetime
-try:
-    with open(os.path.expanduser('~/.slack-gatekeeper-state.json'), 'r') as f:
-        state = json.load(f)
-    today = datetime.now().strftime('%Y-%m-%d')
-    if state.get('stats_date') == today:
-        slack_opens = state.get('slack_opens', 0)
-        gmail_opens = state.get('gmail_opens', 0)
-        prevented = state.get('distractions_prevented', 0)
-        print(f"{slack_opens}|{gmail_opens}|{prevented}")
-    else:
-        print("0|0|0")
-except:
-    print("0|0|0")
-PYEOF
-}
-
-# Show control panel
-if is_running; then
-    STATUS="🟢 ACTIVE"
-    ACTION="⏸ Pause"
+if pgrep -f 'python.*fokuskeeper.py' > /dev/null; then
+    STATUS="ACTIVE"
+    ACTION="Stop"
 else
-    STATUS="🔴 STOPPED"
-    ACTION="▶ Start"
+    STATUS="STOPPED"
+    ACTION="Start"
 fi
 
-COUNTS=\$(get_counts)
-SLACK_OPENS=\$(echo \$COUNTS | cut -d'|' -f1)
-GMAIL_OPENS=\$(echo \$COUNTS | cut -d'|' -f2)
-PREVENTED=\$(echo \$COUNTS | cut -d'|' -f3)
-
-CHOICE=\$(osascript << OSASCRIPT
-display dialog "━━━━━━━━━━━━━━━━━━━━━━
-🚪 DISTRACTION GATEKEEPER
-━━━━━━━━━━━━━━━━━━━━━━
-
-\$STATUS
-
-📊 Slack Opens: \$SLACK_OPENS
-📧 Gmail Opens: \$GMAIL_OPENS
-💪 Distractions Prevented: \$PREVENTED
-
-━━━━━━━━━━━━━━━━━━━━━━" buttons {"\$ACTION", "🔄 Reset"} default button 1
-button returned of result
-OSASCRIPT
-)
+CHOICE=\$(osascript -e "button returned of (display dialog \"FokusKeeper is \$STATUS\" buttons {\"\$ACTION\", \"Stats\", \"Cancel\"} default button 1)")
 
 case "\$CHOICE" in
-    "▶ Start")
-        cd "$INSTALL_DIR"
-        python3 slack_gatekeeper.py > ~/Library/Logs/gatekeeper.log 2>&1 &
-        ;;
-    "⏸ Pause")
-        pkill -f slack_gatekeeper.py
-        ;;
-    "🔄 Reset")
-        python3 << 'PYEOF'
-import json
-import os
-from datetime import datetime
-with open(os.path.expanduser('~/.slack-gatekeeper-state.json'), 'w') as f:
-    json.dump({'slack_opens': 0, 'gmail_opens': 0, 'distractions_prevented': 0, 'daily_opens': 0, 'stats_date': datetime.now().strftime('%Y-%m-%d')}, f)
-PYEOF
-        ;;
+    Start) "\$FK" start ;;
+    Stop)  "\$FK" stop ;;
+    Stats) "\$FK" stats ;;
 esac
 EOF
-
-chmod +x "$HOME/Desktop/GATEKEEPER.command"
-echo "   ✅ Created: ~/Desktop/GATEKEEPER.command"
+    chmod +x "$HOME/Desktop/FOKUSKEEPER.command"
+    echo "      Created: ~/Desktop/FOKUSKEEPER.command"
+else
+    echo "[3/4] Skipping Desktop control panel (pass --with-control-panel to add it)."
+fi
 echo ""
 
-# Step 4: Test the gatekeeper
-echo "4️⃣  Testing the gatekeeper..."
-cd "$INSTALL_DIR"
-python3 slack_gatekeeper.py > ~/Library/Logs/gatekeeper.log 2>&1 &
-sleep 2
-
-if pgrep -f slack_gatekeeper.py > /dev/null; then
-    echo "   ✅ Gatekeeper started successfully!"
-    ./gatekeeper status
+# Step 4: Start the daemon and verify
+echo "[4/4] Starting the daemon..."
+"$INSTALL_DIR/fokuskeeper" start
+sleep 1
+if pgrep -f 'python.*fokuskeeper.py' > /dev/null; then
+    echo "      Daemon is running."
 else
-    echo "   ❌ Failed to start. Check logs: tail ~/Library/Logs/gatekeeper.log"
+    echo "      Daemon failed to start. Check: ~/Library/Logs/fokuskeeper-stdout.log" >&2
     exit 1
 fi
 
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "✅ Installation Complete!"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "=================================="
+echo "Installation complete"
+echo "=================================="
 echo ""
-echo "📋 NEXT STEPS:"
+echo "NEXT STEPS:"
 echo ""
-echo "1. Add to Login Items for auto-start:"
-echo "   • Open System Settings → General → Login Items"
-echo "   • Click '+' button"
-echo "   • Select: ~/Applications/StartGatekeeper.app"
-echo "   • Click Add"
+echo "1. Auto-start at login:"
+echo "   System Settings -> General -> Login Items -> '+' -> select"
+echo "   ~/Applications/FokusKeeper.app"
 echo ""
-echo "2. Test it:"
-echo "   • Try opening Slack"
-echo "   • You should see the gatekeeper dialog!"
+echo "2. Permissions:"
+echo "   macOS will ask for Automation permission the first time"
+echo "   FokusKeeper interacts with other apps. Click Allow."
 echo ""
-echo "3. Control Panel:"
-echo "   • Double-click GATEKEEPER.command on Desktop"
-echo "   • Or run: ./gatekeeper status"
+echo "3. Everyday control:"
+echo "   $INSTALL_DIR/fokuskeeper {start|stop|status|stats}"
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-

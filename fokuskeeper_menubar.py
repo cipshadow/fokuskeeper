@@ -1,7 +1,7 @@
 #!/usr/bin/python3
-"""Menu bar status icon for the Slack gatekeeper daemon.
+"""Menu bar status icon for the FokusKeeper daemon.
 
-Does not run any gatekeeper logic itself — slack_gatekeeper.py keeps doing that
+Does not run any FokusKeeper logic itself — fokuskeeper.py keeps doing that
 as its own process. This polls for that process on a timer, shows an on/off
 icon, and can start or stop it.
 
@@ -28,10 +28,10 @@ import rumps
 import rumps.events  # not re-exported by rumps/__init__, so import it directly
 
 HERE = Path(__file__).resolve().parent
-DAEMON_SCRIPT = HERE / "slack_gatekeeper.py"
-AGENT_LABEL = "com.cip.slack-gatekeeper"
-PROCESS_PATTERN = "slack_gatekeeper.py"
-LOCK_FILE = Path.home() / ".gatekeeper-menubar.lock"
+DAEMON_SCRIPT = HERE / "fokuskeeper.py"
+AGENT_LABEL = "com.fokuskeeper.daemon"
+PROCESS_PATTERN = "python.*fokuskeeper.py"
+LOCK_FILE = Path.home() / ".fokuskeeper-menubar.lock"
 POLL_SECONDS = 5
 
 ICON_SYMBOLS_ON = ("shield.lefthalf.filled", "lock.shield")
@@ -74,8 +74,10 @@ def start_daemon():
 
     # No agent on this machine (or kickstart refused) — run it ourselves.
     # start_new_session detaches it so it outlives this menu bar app.
+    venv_python = HERE / ".venv" / "bin" / "python3"
+    python = str(venv_python) if venv_python.exists() else "/usr/bin/python3"
     subprocess.Popen(
-        ["/usr/bin/python3", "-u", str(DAEMON_SCRIPT)],
+        [python, "-u", str(DAEMON_SCRIPT), "run"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -87,12 +89,12 @@ def stop_daemon():
     subprocess.run(["pkill", "-f", PROCESS_PATTERN], capture_output=True, text=True)
 
 
-class GatekeeperStatusApp(rumps.App):
+class FokusKeeperStatusApp(rumps.App):
     def __init__(self):
-        super().__init__("Gatekeeper", title=FALLBACK_TITLE_OFF, quit_button="Quit")
+        super().__init__("FokusKeeper", title=FALLBACK_TITLE_OFF, quit_button="Quit")
         self.on = False
 
-        self.toggle_item = rumps.MenuItem("Start gatekeeper", callback=self.toggle)
+        self.toggle_item = rumps.MenuItem("Start FokusKeeper", callback=self.toggle)
         self.menu = [self.toggle_item]
 
         self.tick(None)
@@ -125,7 +127,7 @@ class GatekeeperStatusApp(rumps.App):
         try:
             for name in names:
                 image = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                    name, "Gatekeeper"
+                    name, "FokusKeeper"
                 )
                 if image is not None:
                     break
@@ -151,7 +153,7 @@ class GatekeeperStatusApp(rumps.App):
 
     def tick(self, _sender):
         self.on = is_running()
-        self.toggle_item.title = "Stop gatekeeper" if self.on else "Start gatekeeper"
+        self.toggle_item.title = "Stop FokusKeeper" if self.on else "Start FokusKeeper"
         self.apply_icon()
 
 
@@ -169,4 +171,4 @@ if __name__ == "__main__":
     AppKit.NSApplication.sharedApplication().setActivationPolicy_(
         AppKit.NSApplicationActivationPolicyAccessory
     )
-    GatekeeperStatusApp().run()
+    FokusKeeperStatusApp().run()
