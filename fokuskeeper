@@ -1,0 +1,391 @@
+#!/bin/bash
+# Simple CLI to control Slack Gatekeeper
+
+# Detect script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+STATE_FILE="$HOME/.slack-gatekeeper-state.json"
+HISTORY_FILE="$HOME/.slack-gatekeeper-history.json"
+
+case "$1" in
+    status)
+        if pgrep -f slack_gatekeeper.py > /dev/null; then
+            echo "✅ Gatekeeper is RUNNING"
+            if [ -f ~/.slack-gatekeeper-state.json ]; then
+                python3 << EOF
+import json
+from datetime import datetime
+import os
+
+state_file = os.path.expanduser('~/.slack-gatekeeper-state.json')
+with open(state_file, 'r') as f:
+    state = json.load(f)
+
+today = datetime.now().strftime('%Y-%m-%d')
+if state.get('stats_date') == today:
+    slack_opens = state.get('slack_opens', 0)
+    gmail_opens = state.get('gmail_opens', 0)
+    prevented = state.get('distractions_prevented', 0)
+    print(f"📊 Slack opens: {slack_opens}")
+    print(f"📧 Gmail opens: {gmail_opens}")
+    print(f"💪 Distractions prevented: {prevented}")
+else:
+    print("📊 Slack opens: 0")
+    print("📧 Gmail opens: 0")
+    print("💪 Distractions prevented: 0")
+EOF
+            fi
+        else
+            echo "❌ Gatekeeper is NOT running"
+            echo "Run: gatekeeper start"
+        fi
+        ;;
+    
+    start)
+        if pgrep -f slack_gatekeeper.py > /dev/null; then
+            echo "Already running!"
+        else
+            cd "$SCRIPT_DIR"
+            python3 slack_gatekeeper.py > ~/Library/Logs/slack-gatekeeper-stdout.log 2>&1 &
+            sleep 2
+            echo "✅ Gatekeeper started"
+            echo "💡 Monitoring Slack and Gmail"
+        fi
+        ;;
+    
+    stop)
+        pkill -f slack_gatekeeper.py
+        echo "⏹️  Gatekeeper stopped"
+        ;;
+    
+    restart)
+        pkill -f slack_gatekeeper.py
+        sleep 1
+        cd "$SCRIPT_DIR"
+        python3 slack_gatekeeper.py > ~/Library/Logs/slack-gatekeeper-stdout.log 2>&1 &
+        sleep 2
+        echo "🔄 Gatekeeper restarted"
+        ;;
+    
+    stats)
+        if [ -f ~/.slack-gatekeeper-state.json ]; then
+            echo "📊 Distraction Statistics"
+            echo "========================="
+            python3 << EOF
+import json
+from datetime import datetime
+import os
+
+state_file = os.path.expanduser('~/.slack-gatekeeper-state.json')
+with open(state_file, 'r') as f:
+    state = json.load(f)
+
+today = datetime.now().strftime('%Y-%m-%d')
+if state.get('stats_date') == today:
+    slack_opens = state.get('slack_opens', 0)
+    gmail_opens = state.get('gmail_opens', 0)
+    prevented = state.get('distractions_prevented', 0)
+    total_opens = slack_opens + gmail_opens
+    
+    print(f"Today ({state['stats_date']}):")
+    print(f"  📊 Slack Opens: {slack_opens}")
+    print(f"  📧 Gmail Opens: {gmail_opens}")
+    print(f"  💪 Distractions Prevented: {prevented}")
+    
+    if prevented > 0:
+        total_attempts = total_opens + prevented
+        success_rate = (prevented / total_attempts) * 100
+        print(f"  🎯 Focus Success Rate: {success_rate:.1f}%")
+    
+    # Show separate cooldowns for Slack and Gmail
+    print()
+    now = datetime.now()
+    
+    # Slack cooldown
+    if 'slack_last_active_time' in state:
+        last_time = datetime.fromisoformat(state['slack_last_active_time'])
+        minutes_ago = int((now - last_time).total_seconds() / 60)
+        cooldown_left = 3 - minutes_ago
+        
+        if cooldown_left > 0:
+            print(f"  📱 Slack Cooldown: {cooldown_left} min remaining")
+        else:
+            print(f"  📱 Slack: ACTIVE (gatekeeper on)")
+    else:
+        print(f"  📱 Slack: ACTIVE (gatekeeper on)")
+    
+    # Gmail cooldown
+    if 'gmail_last_active_time' in state:
+        last_time = datetime.fromisoformat(state['gmail_last_active_time'])
+        minutes_ago = int((now - last_time).total_seconds() / 60)
+        cooldown_left = 3 - minutes_ago
+        
+        if cooldown_left > 0:
+            print(f"  📧 Gmail Cooldown: {cooldown_left} min remaining")
+        else:
+            print(f"  📧 Gmail: ACTIVE (gatekeeper on)")
+    else:
+        print(f"  📧 Gmail: ACTIVE (gatekeeper on)")
+else:
+    print("No activity today")
+EOF
+        else
+            echo "No stats available"
+        fi
+        ;;
+    
+    logs)
+        if [ -f ~/Library/Logs/slack-gatekeeper.log ]; then
+            tail -20 ~/Library/Logs/slack-gatekeeper.log
+        else
+            echo "No logs found"
+        fi
+        ;;
+    
+    reset)
+        if [ -f ~/.slack-gatekeeper-state.json ]; then
+            python3 << EOF
+import json
+from datetime import datetime
+import os
+
+state = {}
+state['slack_opens'] = 0
+state['gmail_opens'] = 0
+state['distractions_prevented'] = 0
+state['daily_opens'] = 0
+state['stats_date'] = datetime.now().strftime('%Y-%m-%d')
+
+state_file = os.path.expanduser('~/.slack-gatekeeper-state.json')
+with open(state_file, 'w') as f:
+    json.dump(state, f)
+
+print("✅ Daily counts reset to 0")
+EOF
+        fi
+        ;;
+    
+    history)
+        if [ -f ~/.slack-gatekeeper-history.json ]; then
+            echo "📊 Historical Statistics"
+            echo "========================"
+            python3 << EOF
+import json
+from datetime import datetime
+from collections import defaultdict
+import os
+
+history_file = os.path.expanduser('~/.slack-gatekeeper-history.json')
+with open(history_file, 'r') as f:
+    history = json.load(f)
+
+# Group by date
+by_date = defaultdict(lambda: {"slack_opened": 0, "gmail_opened": 0, "opened": 0, "prevented": 0})
+for entry in history:
+    date = entry["date"]
+    event_type = entry["type"]
+    by_date[date][event_type] += 1
+
+# Sort by date and show last 7 days
+sorted_dates = sorted(by_date.keys(), reverse=True)[:7]
+
+print("Last 7 days:\n")
+for date in sorted_dates:
+    slack_opens = by_date[date]["slack_opened"]
+    gmail_opens = by_date[date]["gmail_opened"]
+    # Handle old format
+    legacy_opens = by_date[date]["opened"]
+    prevented = by_date[date]["prevented"]
+    
+    total_opens = slack_opens + gmail_opens + legacy_opens
+    total = total_opens + prevented
+    
+    if total > 0:
+        success_rate = (prevented / total) * 100 if total > 0 else 0
+        parts = []
+        if slack_opens > 0:
+            parts.append(f"{slack_opens} Slack")
+        if gmail_opens > 0:
+            parts.append(f"{gmail_opens} Gmail")
+        if legacy_opens > 0:
+            parts.append(f"{legacy_opens} opens")
+        opens_str = " + ".join(parts) if parts else "0 opens"
+        print(f"{date}: {opens_str}, {prevented} blocked ({success_rate:.0f}% success)")
+    else:
+        print(f"{date}: No activity")
+
+print(f"\nTotal events tracked: {len(history)}")
+EOF
+        else
+            echo "No historical data yet"
+        fi
+        ;;
+    
+    report)
+        if [ -f ~/.slack-gatekeeper-history.json ]; then
+            python3 << 'EOF'
+import json
+from datetime import datetime, timedelta
+from collections import defaultdict
+import os
+
+history_file = os.path.expanduser('~/.slack-gatekeeper-history.json')
+with open(history_file, 'r') as f:
+    history = json.load(f)
+
+# Group by date
+by_date = defaultdict(lambda: {"slack_opened": 0, "gmail_opened": 0, "opened": 0, "prevented": 0})
+for entry in history:
+    date = entry["date"]
+    event_type = entry["type"]
+    by_date[date][event_type] += 1
+
+# Calculate totals
+total_slack = sum(d["slack_opened"] for d in by_date.values())
+total_gmail = sum(d["gmail_opened"] for d in by_date.values())
+total_legacy = sum(d["opened"] for d in by_date.values())
+total_opens = total_slack + total_gmail + total_legacy
+total_blocked = sum(d["prevented"] for d in by_date.values())
+total_attempts = total_opens + total_blocked
+
+# Time calculations (10 min per blocked distraction)
+minutes_saved = total_blocked * 10
+hours_saved = minutes_saved // 60
+days_saved = hours_saved / 8  # 8-hour workday
+
+# Success rate
+success_rate = (total_blocked / total_attempts * 100) if total_attempts > 0 else 0
+
+# Date range
+sorted_dates = sorted(by_date.keys())
+first_date = sorted_dates[0] if sorted_dates else "N/A"
+last_date = sorted_dates[-1] if sorted_dates else "N/A"
+num_days = len(sorted_dates)
+
+# Weekly stats (last 4 weeks)
+today = datetime.now()
+weeks = defaultdict(lambda: {"opens": 0, "blocked": 0})
+for date_str, data in by_date.items():
+    date = datetime.strptime(date_str, "%Y-%m-%d")
+    week_start = date - timedelta(days=date.weekday())
+    week_key = week_start.strftime("%Y-%m-%d")
+    opens = data["slack_opened"] + data["gmail_opened"] + data["opened"]
+    weeks[week_key]["opens"] += opens
+    weeks[week_key]["blocked"] += data["prevented"]
+
+# Best/worst days
+best_day = None
+best_rate = -1
+worst_day = None
+worst_rate = 101
+for date_str, data in by_date.items():
+    opens = data["slack_opened"] + data["gmail_opened"] + data["opened"]
+    blocked = data["prevented"]
+    total = opens + blocked
+    if total >= 5:  # Only count days with at least 5 attempts
+        rate = (blocked / total * 100) if total > 0 else 0
+        if rate > best_rate:
+            best_rate = rate
+            best_day = date_str
+        if rate < worst_rate:
+            worst_rate = rate
+            worst_day = date_str
+
+# Print report
+print("=" * 60)
+print("📊 FOCUS GATEKEEPER - COMPREHENSIVE REPORT")
+print("=" * 60)
+print()
+
+print("🗓️  TRACKING PERIOD")
+print(f"   First record: {first_date}")
+print(f"   Last record:  {last_date}")
+print(f"   Days tracked: {num_days}")
+print()
+
+print("📈 ALL-TIME TOTALS")
+print(f"   Total attempts:        {total_attempts:,}")
+print(f"   Distractions blocked:  {total_blocked:,}")
+print(f"   Times opened:          {total_opens:,}")
+if total_slack > 0:
+    print(f"      └─ Slack:           {total_slack:,}")
+if total_gmail > 0:
+    print(f"      └─ Gmail:           {total_gmail:,}")
+if total_legacy > 0:
+    print(f"      └─ Other:           {total_legacy:,}")
+print()
+
+print("⏰ TIME RESCUED")
+print(f"   Minutes saved:  {minutes_saved:,} min")
+print(f"   Hours saved:    {hours_saved:,} hours")
+print(f"   Workdays saved: {days_saved:.1f} days (8hr/day)")
+print()
+
+print("🎯 FOCUS SUCCESS")
+print(f"   Overall success rate: {success_rate:.1f}%")
+if best_day:
+    print(f"   Best day:  {best_day} ({best_rate:.0f}% blocked)")
+if worst_day:
+    print(f"   Worst day: {worst_day} ({worst_rate:.0f}% blocked)")
+print()
+
+print("📅 WEEKLY BREAKDOWN (last 4 weeks)")
+print("-" * 40)
+sorted_weeks = sorted(weeks.keys(), reverse=True)[:4]
+for week in sorted_weeks:
+    data = weeks[week]
+    total = data["opens"] + data["blocked"]
+    rate = (data["blocked"] / total * 100) if total > 0 else 0
+    week_end = datetime.strptime(week, "%Y-%m-%d") + timedelta(days=6)
+    print(f"   {week} to {week_end.strftime('%Y-%m-%d')}:")
+    print(f"      {data['blocked']} blocked, {data['opens']} opened ({rate:.0f}% success)")
+print()
+
+# Trend analysis
+if len(sorted_weeks) >= 2:
+    recent = weeks[sorted_weeks[0]]
+    previous = weeks[sorted_weeks[1]]
+    recent_total = recent["opens"] + recent["blocked"]
+    prev_total = previous["opens"] + previous["blocked"]
+    recent_rate = (recent["blocked"] / recent_total * 100) if recent_total > 0 else 0
+    prev_rate = (previous["blocked"] / prev_total * 100) if prev_total > 0 else 0
+    
+    print("📊 TREND")
+    if recent_rate > prev_rate:
+        print(f"   ✅ Improving! {recent_rate:.0f}% vs {prev_rate:.0f}% last week")
+    elif recent_rate < prev_rate:
+        print(f"   ⚠️  Declining. {recent_rate:.0f}% vs {prev_rate:.0f}% last week")
+    else:
+        print(f"   ➡️  Steady at {recent_rate:.0f}%")
+    print()
+
+print("=" * 60)
+print("💡 Tip: Each blocked distraction saves ~10 min of focus time")
+print("=" * 60)
+EOF
+        else
+            echo "No historical data yet. Start using the gatekeeper to build your stats!"
+        fi
+        ;;
+    
+    *)
+        echo "Distraction Gatekeeper CLI"
+        echo "=========================="
+        echo ""
+        echo "Usage: gatekeeper <command>"
+        echo ""
+        echo "Commands:"
+        echo "  status    - Check if gatekeeper is running"
+        echo "  start     - Start the gatekeeper"
+        echo "  stop      - Stop the gatekeeper"
+        echo "  restart   - Restart the gatekeeper"
+        echo "  stats     - Show today's statistics"
+        echo "  history   - Show last 7 days"
+        echo "  report    - Show comprehensive all-time report"
+        echo "  logs      - View recent logs"
+        echo "  reset     - Reset today's count to 0"
+        echo ""
+        echo "Monitoring: Slack app + Gmail in Chrome"
+        echo "Cooldown: 3 minutes after opening either"
+        ;;
+esac
+
