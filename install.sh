@@ -100,16 +100,11 @@ else
 fi
 echo ""
 
-# Step 4: Start the daemon and verify
+# Step 4: Start the daemon ("fokuskeeper start" verifies and exits 1 on
+# failure, which aborts this script via set -e)
 echo "[4/4] Starting the daemon..."
 "$INSTALL_DIR/fokuskeeper" start
-sleep 1
-if pgrep -f 'python.*fokuskeeper.py' > /dev/null; then
-    echo "      Daemon is running."
-else
-    echo "      Daemon failed to start. Check: ~/Library/Logs/fokuskeeper-stdout.log" >&2
-    exit 1
-fi
+echo "      Daemon is running."
 
 echo ""
 echo "=================================="

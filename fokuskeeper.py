@@ -17,6 +17,9 @@ from urllib.parse import urlparse
 
 # Configuration
 CHROME_APP_NAME = "Google Chrome"
+# pgrep/pkill pattern for the daemon process. Deliberately `python.*` + script
+# name so an editor session with the file open never matches.
+DAEMON_PROCESS_PATTERN = "python.*fokuskeeper.py"
 COOLDOWN_MINUTES = 3
 QUIET_PERIOD_MINUTES = 60  # skip the prompt if this app hasn't been used in this long
 LOG_FILE = Path.home() / "Library/Logs/fokuskeeper.log"
@@ -116,17 +119,17 @@ def enabled_targets():
     return load_enabled_targets()
 
 
-def match_app_name(app_name):
+def match_app_name(app_name, targets=None):
     """Return the enabled target whose app_name exactly equals app_name, or None."""
     if not app_name:
         return None
-    for target in enabled_targets():
+    for target in enabled_targets() if targets is None else targets:
         if target.app_name is not None and app_name == target.app_name:
             return target
     return None
 
 
-def match_url(url):
+def match_url(url, targets=None):
     """Return the enabled target whose url_domains match the URL's hostname.
 
     Hostname-suffix semantics: "reddit.com" matches reddit.com and
@@ -142,7 +145,7 @@ def match_url(url):
     if not host:
         return None
     host = host.lower()
-    for target in enabled_targets():
+    for target in enabled_targets() if targets is None else targets:
         for domain in target.url_domains:
             if host == domain or host.endswith("." + domain):
                 return target
@@ -217,21 +220,24 @@ def load_state():
             return {}
     return {}
 
-def save_state(state):
-    """Save state to file with file locking."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(STATE_FILE, "w") as f:
+def _write_json_file(path, data, lock=False):
+    """Write JSON with user-only permissions; optionally under an exclusive lock."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
         try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # Exclusive lock
-            json.dump(state, f, indent=2)
+            if lock:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Unlock
-    
-    # Set secure permissions (user-only)
-    os.chmod(STATE_FILE, 0o600)
+            if lock:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    os.chmod(path, 0o600)
+
+def save_state(state):
+    """Save state to file with file locking."""
+    _write_json_file(STATE_FILE, state, lock=True)
 
 def get_today_date():
     """Get today's date as string (YYYY-MM-DD)."""
@@ -379,6 +385,24 @@ def update_last_seen(app_type="slack"):
     """Record that the app was just focused. Does NOT extend the cooldown."""
     state = load_state()
     state[f"{app_type}_last_seen"] = datetime.now().isoformat()
+    save_state(state)
+
+# The quiet-period threshold is minutes-scale, so last_seen only needs coarse
+# freshness — refreshing at most every LAST_SEEN_REFRESH_SECONDS avoids an
+# fsync'd state write on every 0.5s poll tick during a cooldown.
+LAST_SEEN_REFRESH_SECONDS = 15
+
+def refresh_last_seen(app_type):
+    """Refresh last_seen while in cooldown, but only when it has gone stale."""
+    state = load_state()
+    now = datetime.now()
+    granted_at = _read_clock(state, app_type, "granted_at")
+    if granted_at is None or now - granted_at >= timedelta(minutes=COOLDOWN_MINUTES):
+        return  # not in cooldown — same predicate the monitor loop used before
+    last_seen = _read_clock(state, app_type, "last_seen")
+    if last_seen is not None and (now - last_seen).total_seconds() < LAST_SEEN_REFRESH_SECONDS:
+        return
+    state[f"{app_type}_last_seen"] = now.isoformat()
     save_state(state)
 
 def is_in_cooldown(app_type="slack"):
@@ -851,9 +875,10 @@ def monitor():
     try:
         while True:
             current_frontmost = get_frontmost_app()
+            targets = enabled_targets()  # one config stat per tick
 
             # Check 1: app-surface targets (edge-triggered on focus change)
-            app_target = match_app_name(current_frontmost)
+            app_target = match_app_name(current_frontmost, targets)
             if app_target is not None and app_target.key != last_app_key:
                 log(f"{app_target.label} activated/focused")
                 allowed = handle_intercept(app_target, AppSurface(app_target))
@@ -866,14 +891,14 @@ def monitor():
                 time.sleep(0.5)
 
             # Track continued usage (refresh last_seen while in cooldown)
-            if app_target is not None and is_in_cooldown(app_target.key):
-                update_last_seen(app_target.key)
+            if app_target is not None:
+                refresh_last_seen(app_target.key)
             last_app_key = app_target.key if app_target is not None else None
 
             # Check 2: web-surface targets in Chrome (edge-triggered on tab URL)
             if current_frontmost == CHROME_APP_NAME:
                 chrome_url = get_chrome_active_tab_url()
-                web_target = match_url(chrome_url)
+                web_target = match_url(chrome_url, targets)
 
                 if web_target is not None and web_target.key != last_web_key:
                     log(f"{web_target.label} tab activated: {chrome_url}")
@@ -891,8 +916,8 @@ def monitor():
                     time.sleep(0.5)
 
                 # Track continued usage (refresh last_seen while in cooldown)
-                if web_target is not None and is_in_cooldown(web_target.key):
-                    update_last_seen(web_target.key)
+                if web_target is not None:
+                    refresh_last_seen(web_target.key)
                 last_web_key = web_target.key if web_target is not None else None
             else:
                 last_web_key = None
@@ -965,7 +990,7 @@ def cmd_stats():
 def cmd_status():
     """Print whether the daemon is running, plus today's stats."""
     result = subprocess.run(
-        ["pgrep", "-f", "python.*fokuskeeper.py"],
+        ["pgrep", "-f", DAEMON_PROCESS_PATTERN],
         capture_output=True,
         text=True
     )
@@ -1047,13 +1072,8 @@ def cmd_report():
     print(f"  Total blocked: {total_prevented}")
 
 def save_config(config):
-    """Write CONFIG_FILE with user-only permissions (save_state pattern)."""
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(CONFIG_FILE, 0o600)
+    """Write CONFIG_FILE with user-only permissions."""
+    _write_json_file(CONFIG_FILE, config)
 
 
 def run_setup():
@@ -1122,12 +1142,7 @@ def cmd_run():
 def cmd_reset():
     """Zero today's counters, preserving the cooldown/quiet-period clocks."""
     state = load_state()
-    state["stats_date"] = get_today_date()
-    for key in TARGET_KEYS:
-        state[f"{key}_opens"] = 0
-        state[f"{key}_prevented"] = 0
-    state["daily_opens"] = 0
-    state["distractions_prevented"] = 0
+    _reset_daily_counters(state)
     save_state(state)
     log("Counters reset via CLI")
     print("Today's counters reset (cooldown clocks preserved).")

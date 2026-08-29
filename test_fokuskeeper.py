@@ -318,8 +318,8 @@ class TestLegacyFileMigration:
         assert not self.new_history.exists()
 
 
-class TestStatsCommand:
-    """`fokuskeeper stats` reads state directly, keyed off {key}_granted_at."""
+class _TempCliMixin:
+    """Temp-file patching for tests that drive main() end to end."""
 
     def setup_method(self):
         self.temp_dir = Path(tempfile.mkdtemp())
@@ -340,6 +340,10 @@ class TestStatsCommand:
              patch.object(sg, 'LEGACY_HISTORY_FILE', self.legacy_history), \
              patch.object(sg, 'LOG_FILE', self.log_file):
             sg.main(argv)
+
+
+class TestStatsCommand(_TempCliMixin):
+    """`fokuskeeper stats` reads state directly, keyed off {key}_granted_at."""
 
     def test_stats_with_no_state_file_reports_zeros(self, capsys):
         self._run_main(["stats"])
@@ -632,28 +636,11 @@ class TestChromeTabRefValidation:
         assert self._ref_for("err: no window", returncode=1) == (None, None)
 
 
-class TestCliAllTargets:
+class TestCliAllTargets(_TempCliMixin):
     """CLI stats iterates every configured target."""
 
-    def setup_method(self):
-        self.temp_dir = Path(tempfile.mkdtemp())
-        self.state_file = self.temp_dir / "state.json"
-        self.history_file = self.temp_dir / "history.json"
-        self.legacy_state = self.temp_dir / "legacy-state.json"
-        self.legacy_history = self.temp_dir / "legacy-history.json"
-        self.log_file = self.temp_dir / "logs" / "fokuskeeper.log"
-
-    def teardown_method(self):
-        import shutil
-        shutil.rmtree(self.temp_dir)
-
     def test_stats_lists_all_ten_targets(self, capsys):
-        with patch.object(sg, 'STATE_FILE', self.state_file), \
-             patch.object(sg, 'HISTORY_FILE', self.history_file), \
-             patch.object(sg, 'LEGACY_STATE_FILE', self.legacy_state), \
-             patch.object(sg, 'LEGACY_HISTORY_FILE', self.legacy_history), \
-             patch.object(sg, 'LOG_FILE', self.log_file):
-            sg.main(["stats"])
+        self._run_main(["stats"])
         out = capsys.readouterr().out
         for target in sg.TARGETS:
             assert target.label in out, target.label
