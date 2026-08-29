@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for Slack Gatekeeper functionality.
+Unit tests for FokusKeeper functionality.
 Focus on testing the new dialog logic without requiring macOS dependencies.
 """
 import pytest
@@ -492,6 +492,129 @@ class TestCooldownAndQuietPeriod:
             sg.update_last_seen("gmail")
             assert sg.is_quiet_period("gmail") is False
             assert sg.is_in_cooldown("gmail") is False
+
+
+class TestLegacyFileMigration:
+    """migrate_legacy_files() copies legacy state/history to the new paths."""
+
+    def setup_method(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.new_state = self.temp_dir / "fokuskeeper-state.json"
+        self.new_history = self.temp_dir / "fokuskeeper-history.json"
+        self.legacy_state = self.temp_dir / "slack-gatekeeper-state.json"
+        self.legacy_history = self.temp_dir / "slack-gatekeeper-history.json"
+
+    def teardown_method(self):
+        for f in self.temp_dir.iterdir():
+            f.unlink()
+        self.temp_dir.rmdir()
+
+    def _patched(self):
+        return [
+            patch.object(sg, 'STATE_FILE', self.new_state),
+            patch.object(sg, 'HISTORY_FILE', self.new_history),
+            patch.object(sg, 'LEGACY_STATE_FILE', self.legacy_state),
+            patch.object(sg, 'LEGACY_HISTORY_FILE', self.legacy_history),
+            patch.object(sg, 'log'),
+        ]
+
+    def _migrate(self):
+        patches = self._patched()
+        for p in patches:
+            p.start()
+        try:
+            sg.migrate_legacy_files()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_migration_copies_legacy_files(self):
+        self.legacy_state.write_text('{"slack_opens": 4}')
+        self.legacy_history.write_text('[{"type": "opened"}]')
+
+        self._migrate()
+
+        assert self.new_state.read_text() == '{"slack_opens": 4}'
+        assert self.new_history.read_text() == '[{"type": "opened"}]'
+        # Legacy files stay in place as rollback
+        assert self.legacy_state.exists()
+        assert self.legacy_history.exists()
+        # New files are user-only
+        assert (self.new_state.stat().st_mode & 0o777) == 0o600
+        assert (self.new_history.stat().st_mode & 0o777) == 0o600
+
+    def test_migration_noop_when_new_files_exist(self):
+        self.legacy_state.write_text('{"old": true}')
+        self.legacy_history.write_text('[{"old": true}]')
+        self.new_state.write_text('{"new": true}')
+        self.new_history.write_text('[{"new": true}]')
+
+        self._migrate()
+
+        assert self.new_state.read_text() == '{"new": true}'
+        assert self.new_history.read_text() == '[{"new": true}]'
+
+    def test_migration_noop_when_legacy_absent(self):
+        self._migrate()
+
+        assert not self.new_state.exists()
+        assert not self.new_history.exists()
+
+
+class TestStatsCommand:
+    """`fokuskeeper stats` reads state directly, keyed off {key}_granted_at."""
+
+    def setup_method(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.state_file = self.temp_dir / "state.json"
+        self.history_file = self.temp_dir / "history.json"
+        self.legacy_state = self.temp_dir / "legacy-state.json"
+        self.legacy_history = self.temp_dir / "legacy-history.json"
+        self.log_file = self.temp_dir / "logs" / "fokuskeeper.log"
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def _run_main(self, argv):
+        with patch.object(sg, 'STATE_FILE', self.state_file), \
+             patch.object(sg, 'HISTORY_FILE', self.history_file), \
+             patch.object(sg, 'LEGACY_STATE_FILE', self.legacy_state), \
+             patch.object(sg, 'LEGACY_HISTORY_FILE', self.legacy_history), \
+             patch.object(sg, 'LOG_FILE', self.log_file):
+            sg.main(argv)
+
+    def test_stats_with_no_state_file_reports_zeros(self, capsys):
+        self._run_main(["stats"])
+        out = capsys.readouterr().out
+
+        assert "FokusKeeper" in out
+        assert "Slack" in out
+        assert "Gmail" in out
+        assert "Total opens: 0" in out
+        assert "Total blocked: 0" in out
+
+    def test_cooldown_remaining_derives_from_granted_at(self):
+        granted = (datetime.now() - timedelta(minutes=1)).isoformat()
+        state = {"slack_granted_at": granted}
+        with patch.object(sg, 'COOLDOWN_MINUTES', 3):
+            remaining = sg.cooldown_remaining_minutes(state, "slack")
+        assert 1.8 <= remaining <= 2.0
+
+    def test_stats_shows_cooldown_from_granted_at(self, capsys):
+        granted = (datetime.now() - timedelta(minutes=1)).isoformat()
+        self.state_file.write_text(json.dumps({
+            "stats_date": sg.get_today_date(),
+            "slack_opens": 2,
+            "slack_prevented": 1,
+            "slack_granted_at": granted,
+        }))
+        with patch.object(sg, 'COOLDOWN_MINUTES', 3):
+            self._run_main(["stats"])
+        out = capsys.readouterr().out
+
+        assert "2m" in out  # ~2 minutes of cooldown left
+        assert "Total opens: 2" in out
 
 
 if __name__ == "__main__":

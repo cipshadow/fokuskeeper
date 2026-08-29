@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Slack Gatekeeper - Prevents mindless Slack checking by requiring intentional purpose.
+FokusKeeper - Prevents mindless distraction checking by requiring intentional purpose.
 """
+import argparse
 import os
+import shutil
 import time
 import subprocess
 import json
@@ -16,9 +18,20 @@ CHROME_APP_NAME = "Google Chrome"
 GMAIL_PATTERN = "mail.google.com"
 COOLDOWN_MINUTES = 3
 QUIET_PERIOD_MINUTES = 60  # skip the prompt if this app hasn't been used in this long
-LOG_FILE = Path.home() / "Library/Logs/slack-gatekeeper.log"
-STATE_FILE = Path.home() / ".slack-gatekeeper-state.json"
-HISTORY_FILE = Path.home() / ".slack-gatekeeper-history.json"
+LOG_FILE = Path.home() / "Library/Logs/fokuskeeper.log"
+STATE_FILE = Path.home() / ".fokuskeeper-state.json"
+HISTORY_FILE = Path.home() / ".fokuskeeper-history.json"
+CONFIG_FILE = Path.home() / ".fokuskeeper-config.json"  # reserved for the TARGETS config (U3)
+
+# Pre-rename paths. Kept so migrate_legacy_files() can copy an existing
+# installation's data across; the legacy files stay in place as rollback.
+LEGACY_STATE_FILE = Path.home() / ".slack-gatekeeper-state.json"
+LEGACY_HISTORY_FILE = Path.home() / ".slack-gatekeeper-history.json"
+
+# Intercept targets. U3 replaces these with a richer TARGETS config; until then
+# every per-target iteration must key off TARGET_KEYS so that swap is one-point.
+TARGET_KEYS = ("slack", "gmail")
+TARGET_LABELS = {"slack": "Slack", "gmail": "Gmail"}
 
 
 
@@ -60,6 +73,24 @@ def log(message):
         # Fallback to standard open if os.open fails
         with open(LOG_FILE, "a") as f:
             f.write(log_entry)
+
+def migrate_legacy_files():
+    """Copy pre-rename state/history files to the new paths, once.
+
+    Copies (never moves) so the legacy files remain as rollback. No-op when the
+    new file already exists or the legacy file is absent.
+    """
+    pairs = (
+        (STATE_FILE, LEGACY_STATE_FILE),
+        (HISTORY_FILE, LEGACY_HISTORY_FILE),
+    )
+    for new_file, legacy_file in pairs:
+        if new_file.exists() or not legacy_file.exists():
+            continue
+        new_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(legacy_file, new_file)
+        os.chmod(new_file, 0o600)
+        log(f"Migrated legacy file {legacy_file} -> {new_file}")
 
 def load_state():
     """Load state (last allowed time, daily stats) from file."""
@@ -477,7 +508,7 @@ def show_confirmation_dialog(slack_count, gmail_count, slack_prevented, gmail_pr
     
     # Simple two-button dialog
     script = f'''
-    set dialogResult to display dialog "{message}" buttons {{"Stay focused", "🔴 I have a reason"}} default button "Stay focused" with icon caution with title "🚪 Focus Gatekeeper"
+    set dialogResult to display dialog "{message}" buttons {{"Stay focused", "🔴 I have a reason"}} default button "Stay focused" with icon caution with title "🚪 FokusKeeper"
     set clickedButton to button returned of dialogResult
     return clickedButton
     '''
@@ -515,11 +546,11 @@ def allow_access(app_type="slack"):
 
 def monitor_slack():
     """Main monitoring loop for Slack and Gmail."""
-    log("Distraction Gatekeeper started (Slack + Gmail)")
-    
+    log("FokusKeeper started (Slack + Gmail)")
+
     # Display helpful startup information
     print("=" * 70)
-    print("🚪 FOCUS GATEKEEPER - Distraction Blocker")
+    print("🚪 FOKUSKEEPER - Distraction Blocker")
     print("=" * 70)
     print()
     print("📋 HOW IT WORKS:")
@@ -685,11 +716,191 @@ def monitor_slack():
             time.sleep(0.5)  # Check twice per second
             
     except KeyboardInterrupt:
-        log("Distraction Gatekeeper stopped")
+        log("FokusKeeper stopped")
         print(f"\nStopped. Slack: {get_daily_count('slack')}, Gmail: {get_daily_count('gmail')}")
 
-if __name__ == "__main__":
+# ============================================================================
+# CLI commands
+# ============================================================================
+
+def load_history():
+    """Load the history event list, degrading to [] on a missing/corrupt file."""
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError, OSError):
+            return []
+    return []
+
+def cooldown_remaining_minutes(state, key):
+    """Minutes of cooldown left for a target, from {key}_granted_at.
+
+    The old bash CLI read {key}_last_active_time, which the daemon no longer
+    writes, so it always showed no cooldown. The grant clock is authoritative.
+    """
+    granted_at = _read_clock(state, key, "granted_at")
+    if granted_at is None:
+        return 0.0
+    remaining = timedelta(minutes=COOLDOWN_MINUTES) - (datetime.now() - granted_at)
+    return max(0.0, remaining.total_seconds() / 60)
+
+def _today_counters(state):
+    """Per-target (opens, prevented) for today, honouring legacy shared keys."""
+    if state.get("stats_date") != get_today_date():
+        return {key: (0, 0) for key in TARGET_KEYS}
+    counters = {}
+    for key in TARGET_KEYS:
+        opens = validate_counter(state.get(f"{key}_opens", 0))
+        prevented = state.get(f"{key}_prevented")
+        if prevented is None:
+            # Legacy state files only carried the shared total.
+            prevented = state.get("distractions_prevented", 0)
+        counters[key] = (opens, validate_counter(prevented))
+    return counters
+
+def cmd_stats():
+    """Print today's per-target stats and cooldowns."""
+    state = load_state()
+    counters = _today_counters(state)
+    print(f"FokusKeeper - Today's stats ({get_today_date()})")
+    for key in TARGET_KEYS:
+        opens, prevented = counters[key]
+        remaining = cooldown_remaining_minutes(state, key)
+        cooldown = f"{remaining:.0f}m left" if remaining > 0 else "none"
+        print(f"  {TARGET_LABELS[key]}: opens {opens}, blocked {prevented}, cooldown {cooldown}")
+    total_opens = sum(opens for opens, _ in counters.values())
+    total_blocked = sum(prevented for _, prevented in counters.values())
+    print(f"  Total opens: {total_opens}")
+    print(f"  Total blocked: {total_blocked}")
+
+def cmd_status():
+    """Print whether the daemon is running, plus today's stats."""
+    result = subprocess.run(
+        ["pgrep", "-f", "python.*fokuskeeper.py"],
+        capture_output=True,
+        text=True
+    )
+    pids = {p.strip() for p in result.stdout.split() if p.strip()}
+    pids.discard(str(os.getpid()))  # this status invocation matches the pattern too
+    if pids:
+        print(f"FokusKeeper daemon: running (pid {', '.join(sorted(pids))})")
+    else:
+        print("FokusKeeper daemon: not running")
+    cmd_stats()
+
+def _bucket_event_type(event_type):
+    """Map a history event type to (target_key, kind) or None.
+
+    Legacy events ("opened"/"prevented") predate the Gmail split and were
+    Slack-only, so they count against slack.
+    """
+    if event_type == "opened":
+        return ("slack", "opened")
+    if event_type == "prevented":
+        return ("slack", "prevented")
+    for key in TARGET_KEYS:
+        for kind in ("opened", "prevented"):
+            if event_type == f"{key}_{kind}":
+                return (key, kind)
+    return None
+
+def cmd_history():
+    """Print the last 7 days of activity grouped by date."""
+    history = load_history()
+    cutoff = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+    days = {}
+    for event in history:
+        date = event.get("date", "")
+        if date < cutoff:
+            continue
+        bucket = _bucket_event_type(event.get("type"))
+        if bucket is None:
+            continue
+        key, kind = bucket
+        day = days.setdefault(date, {k: {"opened": 0, "prevented": 0} for k in TARGET_KEYS})
+        day[key][kind] += 1
+
+    print("FokusKeeper - Last 7 days")
+    if not days:
+        print("  No activity recorded.")
+        return
+    for date in sorted(days):
+        parts = [
+            f"{TARGET_LABELS[key]} opens {days[date][key]['opened']}, blocked {days[date][key]['prevented']}"
+            for key in TARGET_KEYS
+        ]
+        print(f"  {date}: " + " | ".join(parts))
+
+def cmd_report():
+    """Print totals across all recorded history."""
+    history = load_history()
+    totals = {key: {"opened": 0, "prevented": 0} for key in TARGET_KEYS}
+    dates = []
+    for event in history:
+        bucket = _bucket_event_type(event.get("type"))
+        if bucket is None:
+            continue
+        key, kind = bucket
+        totals[key][kind] += 1
+        if event.get("date"):
+            dates.append(event["date"])
+
+    print("FokusKeeper - All-time report")
+    if not dates:
+        print("  No history recorded.")
+        return
+    print(f"  From {min(dates)} to {max(dates)}")
+    for key in TARGET_KEYS:
+        print(f"  {TARGET_LABELS[key]}: opens {totals[key]['opened']}, blocked {totals[key]['prevented']}")
+    total_opened = sum(t["opened"] for t in totals.values())
+    total_prevented = sum(t["prevented"] for t in totals.values())
+    print(f"  Total opens: {total_opened}")
+    print(f"  Total blocked: {total_prevented}")
+
+def cmd_reset():
+    """Zero today's counters, preserving the cooldown/quiet-period clocks."""
+    state = load_state()
+    state["stats_date"] = get_today_date()
+    for key in TARGET_KEYS:
+        state[f"{key}_opens"] = 0
+        state[f"{key}_prevented"] = 0
+    state["daily_opens"] = 0
+    state["distractions_prevented"] = 0
+    save_state(state)
+    log("Counters reset via CLI")
+    print("Today's counters reset (cooldown clocks preserved).")
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="fokuskeeper",
+        description="FokusKeeper - distraction gate for Slack and Gmail.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=["run", "stats", "status", "history", "report", "reset"],
+        help="run: start the monitor daemon (default); stats: today's numbers; "
+             "status: daemon liveness + stats; history: last 7 days; "
+             "report: all-time totals; reset: zero today's counters",
+    )
+    args = parser.parse_args(argv)
+
     # Ensure log directory exists
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    monitor_slack()
+    migrate_legacy_files()
+
+    dispatch = {
+        "run": monitor_slack,
+        "stats": cmd_stats,
+        "status": cmd_status,
+        "history": cmd_history,
+        "report": cmd_report,
+        "reset": cmd_reset,
+    }
+    dispatch[args.command]()
+
+if __name__ == "__main__":
+    main()
 
