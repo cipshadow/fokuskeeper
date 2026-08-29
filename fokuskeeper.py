@@ -9,13 +9,14 @@ import time
 import subprocess
 import json
 import fcntl
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Configuration
-SLACK_APP_NAME = "Slack"
 CHROME_APP_NAME = "Google Chrome"
-GMAIL_PATTERN = "mail.google.com"
 COOLDOWN_MINUTES = 3
 QUIET_PERIOD_MINUTES = 60  # skip the prompt if this app hasn't been used in this long
 LOG_FILE = Path.home() / "Library/Logs/fokuskeeper.log"
@@ -28,10 +29,75 @@ CONFIG_FILE = Path.home() / ".fokuskeeper-config.json"  # reserved for the TARGE
 LEGACY_STATE_FILE = Path.home() / ".slack-gatekeeper-state.json"
 LEGACY_HISTORY_FILE = Path.home() / ".slack-gatekeeper-history.json"
 
-# Intercept targets. U3 replaces these with a richer TARGETS config; until then
-# every per-target iteration must key off TARGET_KEYS so that swap is one-point.
-TARGET_KEYS = ("slack", "gmail")
-TARGET_LABELS = {"slack": "Slack", "gmail": "Gmail"}
+# Intercept targets. A target can expose an app surface (macOS frontmost-process
+# name), a web surface (Chrome tab hostnames), or both. Keys "slack" and "gmail"
+# must keep these exact spellings: state-file counters/clocks are keyed on them.
+
+@dataclass(frozen=True)
+class Target:
+    key: str
+    label: str
+    app_name: str = None      # macOS frontmost-process name; None = web-only
+    url_domains: tuple = ()   # hostname suffix matches, Chrome only
+
+TARGETS = (
+    Target("slack", "Slack", "Slack", ("app.slack.com",)),
+    Target("gmail", "Gmail", None, ("mail.google.com",)),
+    Target("whatsapp", "WhatsApp", "WhatsApp", ("web.whatsapp.com",)),
+    Target("instagram", "Instagram", None, ("instagram.com",)),
+    Target("facebook", "Facebook", None, ("facebook.com",)),
+    Target("reddit", "Reddit", None, ("reddit.com",)),
+    Target("youtube", "YouTube", None, ("youtube.com",)),
+    Target("x", "X", None, ("x.com", "twitter.com")),
+    Target("tiktok", "TikTok", None, ("tiktok.com",)),
+    Target("linkedin", "LinkedIn", None, ("linkedin.com",)),
+)
+
+TARGETS_BY_KEY = {t.key: t for t in TARGETS}
+TARGET_KEYS = tuple(t.key for t in TARGETS)
+TARGET_LABELS = {t.key: t.label for t in TARGETS}
+
+
+def enabled_targets():
+    """The targets the daemon currently intercepts.
+
+    Seam for a later config unit (CONFIG_FILE); all matching must go through
+    here, never through TARGETS directly.
+    """
+    return TARGETS
+
+
+def match_app_name(app_name):
+    """Return the enabled target whose app_name exactly equals app_name, or None."""
+    if not app_name:
+        return None
+    for target in enabled_targets():
+        if target.app_name is not None and app_name == target.app_name:
+            return target
+    return None
+
+
+def match_url(url):
+    """Return the enabled target whose url_domains match the URL's hostname.
+
+    Hostname-suffix semantics: "reddit.com" matches reddit.com and
+    old.reddit.com, but never notreddit.com — and slack.com does NOT match
+    the app.slack.com target.
+    """
+    if not url:
+        return None
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        return None
+    if not host:
+        return None
+    host = host.lower()
+    for target in enabled_targets():
+        for domain in target.url_domains:
+            if host == domain or host.endswith("." + domain):
+                return target
+    return None
 
 
 
@@ -122,66 +188,57 @@ def get_today_date():
     """Get today's date as string (YYYY-MM-DD)."""
     return datetime.now().strftime("%Y-%m-%d")
 
+def _reset_daily_counters(state):
+    """Zero every target's counters (and the legacy totals) for a fresh day."""
+    state["stats_date"] = get_today_date()
+    for key in TARGET_KEYS:
+        state[f"{key}_opens"] = 0
+        state[f"{key}_prevented"] = 0
+    # Legacy combined totals, kept for backwards compatibility
+    state["daily_opens"] = 0
+    state["distractions_prevented"] = 0
+
 def increment_daily_count(app_type="slack"):
     """Increment today's open count for specified app and return new count."""
     state = load_state()
-    today = get_today_date()
-    
+
     # Reset counts if it's a new day
-    if state.get("stats_date") != today:
-        state["stats_date"] = today
-        state["slack_opens"] = 0
-        state["gmail_opens"] = 0
-        state["slack_prevented"] = 0
-        state["gmail_prevented"] = 0
-        state["distractions_prevented"] = 0
-        # Keep old "daily_opens" for backwards compatibility
-        state["daily_opens"] = 0
-    
-    # Increment specific app counter
-    if app_type == "slack":
-        state["slack_opens"] = state.get("slack_opens", 0) + 1
-        count = state["slack_opens"]
-    else:  # gmail
-        state["gmail_opens"] = state.get("gmail_opens", 0) + 1
-        count = state["gmail_opens"]
-    
+    if state.get("stats_date") != get_today_date():
+        _reset_daily_counters(state)
+
+    state[f"{app_type}_opens"] = state.get(f"{app_type}_opens", 0) + 1
+    count = state[f"{app_type}_opens"]
+
     # Update total for backwards compatibility
-    state["daily_opens"] = state.get("slack_opens", 0) + state.get("gmail_opens", 0)
-    
+    state["daily_opens"] = sum(state.get(f"{key}_opens", 0) for key in TARGET_KEYS)
+
     save_state(state)
-    
+
     # Save to history with specific type
     save_to_history(f"{app_type}_opened")
-    
+
     return count
 
 def increment_prevented_count(app_type="slack"):
     """Increment today's distractions prevented count for specified app and return new count."""
     state = load_state()
-    today = get_today_date()
 
     # Reset counts if it's a new day
-    if state.get("stats_date") != today:
-        state["stats_date"] = today
-        state["slack_opens"] = 0
-        state["gmail_opens"] = 0
-        state["slack_prevented"] = 0
-        state["gmail_prevented"] = 0
-        state["distractions_prevented"] = 0
-        state["daily_opens"] = 0
+    if state.get("stats_date") != get_today_date():
+        _reset_daily_counters(state)
 
-    key = "slack_prevented" if app_type == "slack" else "gmail_prevented"
-    state[key] = state.get(key, 0) + 1
+    state[f"{app_type}_prevented"] = state.get(f"{app_type}_prevented", 0) + 1
 
     # Keep combined total for backwards compatibility
-    state["distractions_prevented"] = state.get("slack_prevented", 0) + state.get("gmail_prevented", 0)
+    state["distractions_prevented"] = sum(
+        state.get(f"{key}_prevented", 0) for key in TARGET_KEYS
+    )
     save_state(state)
 
     # Save to history with specific type
     save_to_history(f"{app_type}_prevented")
 
-    return state[key]
+    return state[f"{app_type}_prevented"]
 
 def save_to_history(event_type):
     """Save event to historical log file with file locking."""
@@ -225,12 +282,9 @@ def get_daily_count(app_type="slack"):
     today = get_today_date()
     
     if state.get("stats_date") == today:
-        if app_type == "slack":
-            return state.get("slack_opens", 0)
-        elif app_type == "gmail":
-            return state.get("gmail_opens", 0)
-        else:  # total
-            return state.get("daily_opens", 0)
+        if app_type in TARGETS_BY_KEY:
+            return state.get(f"{app_type}_opens", 0)
+        return state.get("daily_opens", 0)  # total
     return 0
 
 def get_prevented_count(app_type="slack"):
@@ -239,8 +293,7 @@ def get_prevented_count(app_type="slack"):
     today = get_today_date()
 
     if state.get("stats_date") == today:
-        key = "slack_prevented" if app_type == "slack" else "gmail_prevented"
-        return state.get(key, 0)
+        return state.get(f"{app_type}_prevented", 0)
     return 0
 
 # Cooldown and quiet period are two different clocks and must not share a key.
@@ -293,10 +346,10 @@ def is_quiet_period(app_type="slack"):
         return True
     return datetime.now() - last_seen >= timedelta(minutes=QUIET_PERIOD_MINUTES)
 
-def is_slack_running():
-    """Check if Slack is currently running."""
+def is_app_running(app_name):
+    """Check if an app's process is currently running (exact process name)."""
     result = subprocess.run(
-        ["pgrep", "-x", "Slack"],
+        ["pgrep", "-x", app_name],
         capture_output=True,
         text=True
     )
@@ -314,13 +367,13 @@ def get_frontmost_app():
         return result.stdout.strip()
     return None
 
-def quit_slack():
-    """Quit Slack application."""
+def quit_app(app_name):
+    """Quit a macOS application by name."""
     subprocess.run(
-        ["osascript", "-e", f'quit app "{SLACK_APP_NAME}"'],
+        ["osascript", "-e", f'quit app "{sanitize_for_applescript(app_name)}"'],
         capture_output=True
     )
-    log("Quit Slack")
+    log(f"Quit {app_name}")
 
 def get_chrome_active_tab_url():
     """Get the URL of the active tab in Chrome."""
@@ -346,16 +399,15 @@ def get_chrome_active_tab_url():
         return result.stdout.strip()
     return ""
 
-def is_gmail_url(url):
-    """Check if URL is Gmail."""
-    return GMAIL_PATTERN in url
-
 def get_chrome_front_tab_ref():
     """Identify the front Chrome window and its active tab by ID.
 
-    Targeting the exact (window, tab) pair is what keeps a restored Gmail tab in
+    Targeting the exact (window, tab) pair is what keeps a restored tab in
     the Chrome profile it came from — "active tab of front window" can drift to
     another profile's window between detection and restore.
+
+    This is the ONLY place tab/window ids may come from: it validates both as
+    digits, which is what makes interpolating them into _tell_tab safe.
     """
     script = '''
     tell application "Google Chrome"
@@ -430,110 +482,259 @@ def _tell_tab(window_id, tab_id, body):
     return False
 
 
-def park_gmail_tab(window_id, tab_id):
-    """Blank out the Gmail tab without closing it, so its window/profile survives."""
+def park_tab(window_id, tab_id, label):
+    """Blank out the tab without closing it, so its window/profile survives."""
     if window_id is None or tab_id is None:
-        log("Could not identify the Gmail tab - leaving it alone")
+        log(f"Could not identify the {label} tab - leaving it alone")
         return False
     if _tell_tab(window_id, tab_id, 'set URL of targetTab to "about:blank"'):
-        log("Parked Gmail tab at about:blank")
+        log(f"Parked {label} tab at about:blank")
         return True
     return False
 
 
-def restore_gmail_tab(window_id, tab_id, original_url):
-    """Restore the parked tab to the exact URL it was on, preserving the u/N account."""
+def restore_tab(window_id, tab_id, original_url, label):
+    """Restore the parked tab to the exact URL it was on (same window/profile)."""
     safe_url = sanitize_for_applescript(original_url)
     if _tell_tab(window_id, tab_id, f'set URL of targetTab to "{safe_url}"'):
-        log(f"Restored Gmail tab in original window/profile: {original_url}")
+        log(f"Restored {label} tab in original window/profile: {original_url}")
         return True
-    log("Could not restore the original Gmail tab - not opening Gmail elsewhere")
+    log(f"Could not restore the original {label} tab - not opening {label} elsewhere")
     return False
 
 
-def discard_parked_tab(window_id, tab_id):
+def discard_parked_tab(window_id, tab_id, label):
     """Close the parked tab after access is denied."""
     if _tell_tab(window_id, tab_id, "close targetTab"):
-        log("Closed parked Gmail tab")
+        log(f"Closed parked {label} tab")
 
-def show_confirmation_dialog(slack_count, gmail_count, slack_prevented, gmail_prevented, app_name="Slack"):
-    """Show enhanced confirmation dialog with stats. Returns True if user has a reason to open app."""
 
-    # Validate counters to prevent overflow/display issues
-    slack_count = validate_counter(slack_count)
-    gmail_count = validate_counter(gmail_count)
-    slack_prevented = validate_counter(slack_prevented)
-    gmail_prevented = validate_counter(gmail_prevented)
-    prevented_count = slack_prevented + gmail_prevented
+# ============================================================================
+# Gate evaluation
+# ============================================================================
 
-    # Calculate success rate
-    total_opens = slack_count + gmail_count
-    total_attempts = total_opens + prevented_count
-    success_rate = (prevented_count / total_attempts * 100) if total_attempts > 0 else 0
+class Gate(Enum):
+    """Outcome of the pre-prompt checks, in precedence order."""
+    COOLDOWN = "cooldown"      # inside the grant window: silent allow
+    FIRST_OPEN = "first_open"  # first open of the day: auto-allow
+    QUIET = "quiet"            # idle for QUIET_PERIOD_MINUTES+: auto-allow
+    PROMPT = "prompt"          # none of the above: intercept and ask
 
-    # Calculate time rescued (10 minutes per blocked distraction)
-    minutes_rescued = prevented_count * 10
-    hours_rescued = minutes_rescued // 60
-    remaining_minutes = minutes_rescued % 60
-    
+
+def evaluate_gate(target):
+    """Pure gate decision for a target. Precedence: COOLDOWN > FIRST_OPEN > QUIET > PROMPT."""
+    key = target.key
+    if is_in_cooldown(key):
+        return Gate.COOLDOWN
+    if get_daily_count(key) == 0:
+        return Gate.FIRST_OPEN
+    if is_quiet_period(key):
+        return Gate.QUIET
+    return Gate.PROMPT
+
+
+# ============================================================================
+# Surfaces — how a target is blocked/restored/discarded on interception
+# ============================================================================
+
+class AppSurface:
+    """A target intercepted as a macOS app (quit on block, relaunch on restore)."""
+
+    def __init__(self, target):
+        self.target = target
+
+    def block(self):
+        quit_app(self.target.app_name)
+
+    def restore(self):
+        subprocess.run(["open", "-a", self.target.app_name])
+
+    def discard(self):
+        pass  # the app is already quit; nothing to clean up
+
+
+class WebSurface:
+    """A target intercepted as a Chrome tab (park on block, restore URL, close on discard).
+
+    window_id/tab_id must come from get_chrome_front_tab_ref() — the only
+    producer that validates them as digits.
+    """
+
+    def __init__(self, target, window_id, tab_id, url):
+        self.target = target
+        self.window_id = window_id
+        self.tab_id = tab_id
+        self.url = url
+
+    def block(self):
+        park_tab(self.window_id, self.tab_id, self.target.label)
+
+    def restore(self):
+        restore_tab(self.window_id, self.tab_id, self.url, self.target.label)
+
+    def discard(self):
+        discard_parked_tab(self.window_id, self.tab_id, self.target.label)
+
+
+def handle_intercept(target, surface):
+    """Shared intercept flow for both surfaces. Returns True when access is allowed."""
+    key = target.key
+    gate = evaluate_gate(target)
+
+    if gate is Gate.COOLDOWN:
+        log(f"Within {target.label} cooldown period - allowing")
+        update_last_seen(key)  # glance only — must not extend the cooldown
+        return True
+
+    if gate is Gate.FIRST_OPEN:
+        new_count = increment_daily_count(key)
+        allow_access(key)
+        log(f"First {target.label} open of the day - auto-allowed (#{new_count})")
+        print(f"First {target.label} open today - allowed automatically")
+        return True
+
+    if gate is Gate.QUIET:
+        new_count = increment_daily_count(key)
+        allow_access(key)
+        log(f"No {target.label} use in {QUIET_PERIOD_MINUTES}+ min - auto-allowed (#{new_count})")
+        print(f"Quiet period - {target.label} allowed automatically")
+        return True
+
+    # Gate.PROMPT — intercept!
+    surface.block()
+    time.sleep(0.3)
+
+    allowed = show_confirmation_dialog(target)
+
+    if allowed:
+        new_count = increment_daily_count(key)
+        allow_access(key)
+        surface.restore()
+        log(f"Re-opened {target.label} (#{new_count} today)")
+        print(f"{target.label} opened - Total today: {new_count}")
+        return True
+
+    surface.discard()
+    prevented_count = increment_prevented_count(key)
+    log(f"{target.label} access denied - distraction prevented (#{prevented_count} today)")
+    print(f"Access denied - good job staying focused! ({prevented_count} distractions prevented)")
+    return False
+
+
+# ============================================================================
+# Confirmation dialog
+# ============================================================================
+
+def format_time_rescued(prevented):
+    """Human time saved: 10 minutes per blocked distraction."""
+    minutes_rescued = prevented * 10
+    hours_rescued, remaining_minutes = divmod(minutes_rescued, 60)
     if hours_rescued > 0:
-        time_rescued = f"{hours_rescued}h {remaining_minutes}m"
+        return f"{hours_rescued}h {remaining_minutes}m"
+    return f"{remaining_minutes}m"
+
+
+def compute_success_rate(total_opens, prevented):
+    """Percentage of today's attempts that were blocked."""
+    total_attempts = total_opens + prevented
+    return (prevented / total_attempts * 100) if total_attempts > 0 else 0
+
+
+def motivation_for(rate):
+    """Motivational line for a success rate percentage."""
+    if rate >= 70:
+        return "Your focus is outstanding today! 🎯"
+    elif rate >= 50:
+        return "You're building great focus habits! 💪"
+    elif rate >= 30:
+        return "Keep pushing - you're making progress! ✨"
     else:
-        time_rescued = f"{remaining_minutes}m"
-    
-    # Create motivational message based on success rate
-    if success_rate >= 70:
-        motivation = "Your focus is outstanding today! 🎯"
-    elif success_rate >= 50:
-        motivation = "You're building great focus habits! 💪"
-    elif success_rate >= 30:
-        motivation = "Keep pushing - you're making progress! ✨"
-    else:
-        motivation = "This is your chance to strengthen focus! 🌟"
-    
-    # Build the enhanced dialog with better visual hierarchy
-    message = (
+        return "This is your chance to strengthen focus! 🌟"
+
+
+def parse_dialog_button(returncode, stdout):
+    """True when the dialog result means \"I have a reason\".
+
+    Non-zero returncode (X button, ESC, cancel) blocks, same as "Stay focused".
+    """
+    if returncode != 0:
+        return False
+    return "reason" in stdout.strip().lower()
+
+
+def collect_stats():
+    """Today's per-target counters as a list of dicts (key, label, opens, prevented)."""
+    counters = _today_counters(load_state())
+    return [
+        {
+            "key": key,
+            "label": TARGET_LABELS[key],
+            "opens": counters[key][0],
+            "prevented": counters[key][1],
+        }
+        for key in TARGET_KEYS
+    ]
+
+
+def build_dialog_message(stats, target):
+    """Dialog body: the intercepted target's numbers plus today's totals.
+
+    Deliberately NOT one line per target — ten targets don't fit a dialog.
+    Every interpolated value passes through sanitize_for_applescript.
+    """
+    by_key = {s["key"]: s for s in stats}
+    mine = by_key.get(target.key, {"opens": 0, "prevented": 0})
+    target_opens = validate_counter(mine["opens"])
+    target_prevented = validate_counter(mine["prevented"])
+    total_opens = sum(validate_counter(s["opens"]) for s in stats)
+    total_prevented = sum(validate_counter(s["prevented"]) for s in stats)
+
+    success_rate = compute_success_rate(total_opens, total_prevented)
+    time_rescued = format_time_rescued(total_prevented)
+    motivation = motivation_for(success_rate)
+    label = sanitize_for_applescript(target.label)
+
+    return (
         f"Taking a distraction break?\\n\\n"
         f"━━━━━━━━━━━━━━━━━━━━\\n\\n"
         f"Today's Focus Metrics\\n\\n"
-        f"  📊  Slack Opens        {slack_count}\\n"
-        f"  📧  Gmail Opens        {gmail_count}\\n"
-        f"  🚫  Slack Blocked      {slack_prevented}\\n"
-        f"  🚫  Gmail Blocked      {gmail_prevented}\\n"
-        f"  ⏰  Time Rescued       {time_rescued}\\n\\n"
+        f"  📊  {label} Opens        {sanitize_for_applescript(target_opens)}\\n"
+        f"  🚫  {label} Blocked      {sanitize_for_applescript(target_prevented)}\\n"
+        f"  📈  All Opens        {sanitize_for_applescript(total_opens)}\\n"
+        f"  🛑  All Blocked      {sanitize_for_applescript(total_prevented)}\\n"
+        f"  ⏰  Time Rescued       {sanitize_for_applescript(time_rescued)}\\n\\n"
         f"━━━━━━━━━━━━━━━━━━━━\\n\\n"
         f"{motivation}\\n\\n"
-        f"Are you sure you need to check {sanitize_for_applescript(app_name)} right now?"
+        f"Are you sure you need to check {label} right now?"
     )
-    
+
+
+def show_confirmation_dialog(target):
+    """Show the confirmation dialog for a target. True if the user has a reason."""
+    message = build_dialog_message(collect_stats(), target)
+
     # Simple two-button dialog
     script = f'''
     set dialogResult to display dialog "{message}" buttons {{"Stay focused", "🔴 I have a reason"}} default button "Stay focused" with icon caution with title "🚪 FokusKeeper"
     set clickedButton to button returned of dialogResult
     return clickedButton
     '''
-    
+
     result = subprocess.run(
         ["osascript", "-e", script],
         capture_output=True,
         text=True
     )
-    
-    if result.returncode == 0:
-        button_clicked = result.stdout.strip()
-        
-        # Check which button was clicked
-        if "reason" in button_clicked.lower():
-            log(f"User has a reason - allowing {app_name} access")
-            return True
-        else:
-            log("User chose to stay focused")
-            return False
+
+    allowed = parse_dialog_button(result.returncode, result.stdout)
+    if allowed:
+        log(f"User has a reason - allowing {target.label} access")
+    elif result.returncode == 0:
+        log("User chose to stay focused")
     else:
-        # User clicked X button (close), pressed ESC, or cancelled dialog
-        # Treat this the same as "Stay focused" - block the distraction
+        # X button (close), ESC, or cancelled dialog — same as "Stay focused"
         log("User closed dialog (X button/ESC) - staying focused")
-        return False
+    return allowed
 
 def allow_access(app_type="slack"):
     """Grant access: start the cooldown clock. This is the ONLY thing that does."""
@@ -544,17 +745,27 @@ def allow_access(app_type="slack"):
     save_state(state)
     log(f"Access allowed - {app_type} cooldown started ({COOLDOWN_MINUTES} min)")
 
-def monitor_slack():
-    """Main monitoring loop for Slack and Gmail."""
-    log("FokusKeeper started (Slack + Gmail)")
+def monitor():
+    """Main monitoring loop across all enabled targets (app + web surfaces)."""
+    targets = enabled_targets()
+    log(f"FokusKeeper started ({', '.join(t.label for t in targets)})")
 
     # Display helpful startup information
     print("=" * 70)
     print("🚪 FOKUSKEEPER - Distraction Blocker")
     print("=" * 70)
     print()
+    print("🎯 WATCHED TARGETS:")
+    for target in targets:
+        surfaces = []
+        if target.app_name:
+            surfaces.append(f"app: {target.app_name}")
+        if target.url_domains:
+            surfaces.append(f"web: {', '.join(target.url_domains)}")
+        print(f"  • {target.label} ({'; '.join(surfaces)})")
+    print()
     print("📋 HOW IT WORKS:")
-    print("  • Detects when you try to open Slack or Gmail")
+    print("  • Detects when you try to open a watched app or site")
     print("  • Shows a dialog making you consciously decide if you need it")
     print("  • Tracks your daily stats and distractions blocked")
     print()
@@ -563,8 +774,8 @@ def monitor_slack():
     print("  uninterrupted access. Timer starts when you STOP using the app.")
     print()
     print(f"🤫 QUIET PERIOD: {QUIET_PERIOD_MINUTES} minutes")
-    print(f"  If an app hasn't been used in {QUIET_PERIOD_MINUTES}+ minutes, the next")
-    print("  open is let through without a prompt (checked per app).")
+    print(f"  If a target hasn't been used in {QUIET_PERIOD_MINUTES}+ minutes, the next")
+    print("  open is let through without a prompt (checked per target).")
     print()
     print("💾 TIME RESCUED CALCULATION:")
     print("  Each blocked distraction saves ~10 minutes of focus time")
@@ -575,149 +786,77 @@ def monitor_slack():
     print(f"  Current value: {COOLDOWN_MINUTES} minutes")
     print()
     print("=" * 70)
-    print(f"📊 Today's Stats: Slack opens: {get_daily_count('slack')}, Gmail opens: {get_daily_count('gmail')}, Slack blocked: {get_prevented_count('slack')}, Gmail blocked: {get_prevented_count('gmail')}")
+    stats_line = ", ".join(
+        f"{t.label} {get_daily_count(t.key)}/{get_prevented_count(t.key)} (opens/blocked)"
+        for t in targets if get_daily_count(t.key) or get_prevented_count(t.key)
+    ) or "no activity yet"
+    print(f"📊 Today's Stats: {stats_line}")
     print("=" * 70)
     print()
     print("Running... (Press Ctrl+C to stop)")
     print()
-    
-    last_frontmost_app = None
-    last_gmail_check = False
-    
+
+    last_app_key = None   # key of the app target that was frontmost last tick
+    last_web_key = None   # key of the web target the Chrome tab showed last tick
+
     try:
         while True:
             current_frontmost = get_frontmost_app()
-            
-            # Check 1: Slack app focus
-            if current_frontmost == SLACK_APP_NAME and last_frontmost_app != SLACK_APP_NAME:
-                log("Slack activated/focused")
-                
-                if is_in_cooldown("slack"):
-                    log("Within Slack cooldown period - allowing")
-                    update_last_seen("slack")  # glance only — must not extend the cooldown
-                elif get_daily_count("slack") == 0:
-                    # First Slack open of the day - let it through without prompting
-                    new_count = increment_daily_count("slack")
-                    allow_access("slack")
-                    log(f"First Slack open of the day - auto-allowed (#{new_count})")
-                    print(f"First Slack open today - allowed automatically")
-                    time.sleep(0.5)
-                    last_frontmost_app = SLACK_APP_NAME
+
+            # Check 1: app-surface targets (edge-triggered on focus change)
+            app_target = match_app_name(current_frontmost)
+            if app_target is not None and app_target.key != last_app_key:
+                log(f"{app_target.label} activated/focused")
+                allowed = handle_intercept(app_target, AppSurface(app_target))
+                if not allowed:
+                    # Reset edge keys so a missed target re-triggers on the
+                    # next focus change (the dialog stole focus meanwhile).
+                    last_app_key = None
+                    last_web_key = None
                     continue
-                elif is_quiet_period("slack"):
-                    # No Slack activity in QUIET_PERIOD_MINUTES - let it through without prompting
-                    new_count = increment_daily_count("slack")
-                    allow_access("slack")
-                    log(f"No Slack use in {QUIET_PERIOD_MINUTES}+ min - auto-allowed (#{new_count})")
-                    print(f"Quiet period - Slack allowed automatically")
-                    time.sleep(0.5)
-                    last_frontmost_app = SLACK_APP_NAME
-                    continue
-                else:
-                    # Not in cooldown - intercept!
-                    quit_slack()
-                    time.sleep(0.3)
+                time.sleep(0.5)
 
-                    # Show current counts
-                    slack_count = get_daily_count("slack")
-                    gmail_count = get_daily_count("gmail")
-                    slack_prevented = get_prevented_count("slack")
-                    gmail_prevented = get_prevented_count("gmail")
+            # Track continued usage (refresh last_seen while in cooldown)
+            if app_target is not None and is_in_cooldown(app_target.key):
+                update_last_seen(app_target.key)
+            last_app_key = app_target.key if app_target is not None else None
 
-                    allowed = show_confirmation_dialog(slack_count, gmail_count, slack_prevented, gmail_prevented, "Slack")
-
-                    if allowed:
-                        new_count = increment_daily_count("slack")
-                        allow_access("slack")
-
-                        subprocess.run(["open", "-a", SLACK_APP_NAME])
-                        log(f"Re-launched Slack (#{new_count} today)")
-                        print(f"Slack opened - Total today: {new_count}")
-
-                        time.sleep(0.5)
-                        last_frontmost_app = SLACK_APP_NAME
-                    else:
-                        prevented_count = increment_prevented_count("slack")
-                        log(f"Slack access denied - distraction prevented (#{prevented_count} today)")
-                        print(f"Access denied - good job staying focused! ({prevented_count} distractions prevented)")
-                        last_frontmost_app = None
-                        continue
-            
-            # Track continued Slack usage (update activity time while using)
-            if current_frontmost == SLACK_APP_NAME and is_in_cooldown("slack"):
-                update_last_seen("slack")
-            
-            # Check 2: Gmail in Chrome
+            # Check 2: web-surface targets in Chrome (edge-triggered on tab URL)
             if current_frontmost == CHROME_APP_NAME:
                 chrome_url = get_chrome_active_tab_url()
-                is_gmail_now = is_gmail_url(chrome_url)
-                
-                # Detect transition to Gmail tab
-                if is_gmail_now and not last_gmail_check:
-                    log(f"Gmail tab activated: {chrome_url}")
-                    
-                    if is_in_cooldown("gmail"):
-                        log("Within Gmail cooldown period - allowing Gmail")
-                        update_last_seen("gmail")  # glance only — must not extend the cooldown
-                    elif get_daily_count("gmail") == 0:
-                        # First Gmail open of the day - let it through without prompting
-                        new_count = increment_daily_count("gmail")
-                        allow_access("gmail")
-                        log(f"First Gmail open of the day - auto-allowed (#{new_count})")
-                        print(f"First Gmail open today - allowed automatically")
-                    elif is_quiet_period("gmail"):
-                        # No Gmail activity in QUIET_PERIOD_MINUTES - let it through without prompting
-                        new_count = increment_daily_count("gmail")
-                        allow_access("gmail")
-                        log(f"No Gmail use in {QUIET_PERIOD_MINUTES}+ min - auto-allowed (#{new_count})")
-                        print(f"Quiet period - Gmail allowed automatically")
-                    else:
-                        # Pin the exact tab so it can be restored into its own profile
-                        original_window_id, original_tab_id = get_chrome_front_tab_ref()
-                        original_url = chrome_url
+                web_target = match_url(chrome_url)
 
-                        # Not in cooldown - intercept!
-                        park_gmail_tab(original_window_id, original_tab_id)
-                        time.sleep(0.3)
+                if web_target is not None and web_target.key != last_web_key:
+                    log(f"{web_target.label} tab activated: {chrome_url}")
+                    # Pin the exact tab so it can be restored into its own
+                    # profile. Ids come ONLY from get_chrome_front_tab_ref.
+                    window_id, tab_id = get_chrome_front_tab_ref()
+                    surface = WebSurface(web_target, window_id, tab_id, chrome_url)
+                    allowed = handle_intercept(web_target, surface)
+                    if not allowed:
+                        # Reset edge keys so a missed target re-triggers on the
+                        # next focus change.
+                        last_web_key = None
+                        last_app_key = None
+                        continue
+                    time.sleep(0.5)
 
-                        # Show current counts
-                        slack_count = get_daily_count("slack")
-                        gmail_count = get_daily_count("gmail")
-                        slack_prevented = get_prevented_count("slack")
-                        gmail_prevented = get_prevented_count("gmail")
-
-                        allowed = show_confirmation_dialog(slack_count, gmail_count, slack_prevented, gmail_prevented, "Gmail")
-
-                        if allowed:
-                            new_count = increment_daily_count("gmail")
-                            allow_access("gmail")  # Separate Gmail cooldown
-
-                            # Restore the original tab in the SAME window/profile/account
-                            restore_gmail_tab(original_window_id, original_tab_id, original_url)
-                            log(f"Re-opened Gmail (#{new_count} today)")
-                            print(f"Gmail opened - Total today: {new_count}")
-
-                            time.sleep(0.5)
-                        else:
-                            discard_parked_tab(original_window_id, original_tab_id)
-                            prevented_count = increment_prevented_count("gmail")
-                            log(f"Gmail access denied - distraction prevented (#{prevented_count} today)")
-                            print(f"Access denied - good job staying focused! ({prevented_count} distractions prevented)")
-                
-                # Track continued Gmail usage (update activity time while using)
-                if is_gmail_now and is_in_cooldown("gmail"):
-                    update_last_seen("gmail")
-                
-                last_gmail_check = is_gmail_now
+                # Track continued usage (refresh last_seen while in cooldown)
+                if web_target is not None and is_in_cooldown(web_target.key):
+                    update_last_seen(web_target.key)
+                last_web_key = web_target.key if web_target is not None else None
             else:
-                last_gmail_check = False
-            
-            last_frontmost_app = current_frontmost
+                last_web_key = None
+
             time.sleep(0.5)  # Check twice per second
-            
+
     except KeyboardInterrupt:
         log("FokusKeeper stopped")
-        print(f"\nStopped. Slack: {get_daily_count('slack')}, Gmail: {get_daily_count('gmail')}")
+        summary = ", ".join(
+            f"{t.label}: {get_daily_count(t.key)}" for t in enabled_targets()
+            if get_daily_count(t.key)
+        ) or "no opens today"
+        print(f"\nStopped. {summary}")
 
 # ============================================================================
 # CLI commands
@@ -874,7 +1013,7 @@ def cmd_reset():
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="fokuskeeper",
-        description="FokusKeeper - distraction gate for Slack and Gmail.",
+        description="FokusKeeper - distraction gate for distracting apps and sites.",
     )
     parser.add_argument(
         "command",
@@ -892,7 +1031,7 @@ def main(argv=None):
     migrate_legacy_files()
 
     dispatch = {
-        "run": monitor_slack,
+        "run": monitor,
         "stats": cmd_stats,
         "status": cmd_status,
         "history": cmd_history,
