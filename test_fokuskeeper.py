@@ -399,7 +399,11 @@ class TestTargetConfig:
     """The ten-target config and the enabled-set seam."""
 
     def test_enabled_targets_returns_all_ten(self):
-        targets = sg.enabled_targets()
+        # Point CONFIG_FILE at a nonexistent path so the machine's real
+        # config can't leak into the test (absent config = all enabled).
+        with patch.object(sg, 'CONFIG_FILE',
+                          Path(tempfile.gettempdir()) / "fk-no-such-config.json"):
+            targets = sg.enabled_targets()
         assert len(targets) == 10
         assert tuple(t.key for t in targets) == sg.TARGET_KEYS
 
@@ -654,6 +658,142 @@ class TestCliAllTargets:
         for target in sg.TARGETS:
             assert target.label in out, target.label
         assert "Total opens: 0" in out
+
+
+class _TempConfigMixin:
+    """Temp CONFIG_FILE patching for the target-config tests."""
+
+    def setup_method(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.config_file = self.temp_dir / "config.json"
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def _patches(self):
+        return [
+            patch.object(sg, 'CONFIG_FILE', self.config_file),
+            patch.object(sg, 'log'),
+        ]
+
+
+class TestEnabledTargetsConfig(_TempConfigMixin):
+    """enabled_targets() reads CONFIG_FILE, defaulting to all targets."""
+
+    def _enabled_keys(self):
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            return tuple(t.key for t in sg.enabled_targets())
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_absent_config_returns_all_ten(self):
+        assert self._enabled_keys() == sg.TARGET_KEYS
+
+    def test_subset_config_returns_those_in_targets_order(self):
+        self.config_file.write_text(json.dumps({"enabled": ["reddit", "slack"]}))
+        # slack precedes reddit in TARGETS, regardless of config order
+        assert self._enabled_keys() == ("slack", "reddit")
+
+    def test_unknown_keys_silently_ignored(self):
+        self.config_file.write_text(json.dumps({"enabled": ["reddit", "myspace"]}))
+        assert self._enabled_keys() == ("reddit",)
+
+    def test_corrupt_json_returns_all_ten(self):
+        self.config_file.write_text("{not json!!")
+        assert self._enabled_keys() == sg.TARGET_KEYS
+
+    def test_wrong_shape_returns_all_ten(self):
+        for payload in ('{"enabled": "reddit"}', '["reddit", "slack"]',
+                        '{"enabled": []}', '"reddit"'):
+            self.config_file.write_text(payload)
+            assert self._enabled_keys() == sg.TARGET_KEYS, payload
+
+    def test_mtime_based_reload_picks_up_config_changes(self):
+        import os as _os
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            self.config_file.write_text(json.dumps({"enabled": ["reddit"]}))
+            assert tuple(t.key for t in sg.enabled_targets()) == ("reddit",)
+
+            self.config_file.write_text(json.dumps({"enabled": ["tiktok"]}))
+            # Force a visibly newer mtime so the reload is deterministic.
+            stat = self.config_file.stat()
+            _os.utime(self.config_file,
+                      ns=(stat.st_atime_ns, stat.st_mtime_ns + 10_000_000))
+            assert tuple(t.key for t in sg.enabled_targets()) == ("tiktok",)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_gating_respects_enabled_set(self):
+        self.config_file.write_text(json.dumps({"enabled": ["reddit"]}))
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            assert sg.match_url("https://app.slack.com/client/x") is None
+            target = sg.match_url("https://old.reddit.com/r/x")
+            assert target is not None and target.key == "reddit"
+            assert sg.match_app_name("Slack") is None
+        finally:
+            for p in patches:
+                p.stop()
+
+
+class TestRunSetup(_TempConfigMixin):
+    """run_setup(): native chooser, cancel-safe, writes CONFIG_FILE 0o600."""
+
+    def _run_setup(self, stdout, returncode=0):
+        mock_result = MagicMock()
+        mock_result.returncode = returncode
+        mock_result.stdout = stdout
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            with patch.object(sg.subprocess, 'run',
+                              return_value=mock_result) as mock_run:
+                sg.run_setup()
+            return mock_run
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_selection_writes_config_in_targets_order(self):
+        self._run_setup("Reddit, Slack\n")
+        assert json.loads(self.config_file.read_text()) == \
+            {"enabled": ["slack", "reddit"]}
+        assert (self.config_file.stat().st_mode & 0o777) == 0o600
+
+    def test_cancel_leaves_config_absent(self):
+        self._run_setup("false\n")
+        assert not self.config_file.exists()
+
+    def test_cancel_leaves_existing_config_untouched(self):
+        self.config_file.write_text(json.dumps({"enabled": ["gmail"]}))
+        self._run_setup("false\n")
+        assert json.loads(self.config_file.read_text()) == {"enabled": ["gmail"]}
+
+    def test_osascript_failure_treated_as_cancel(self):
+        self._run_setup("", returncode=1)
+        assert not self.config_file.exists()
+
+    def test_chooser_script_lists_all_labels_multi_select(self):
+        mock_run = self._run_setup("false\n")
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "osascript"
+        script = cmd[2]
+        for target in sg.TARGETS:
+            assert target.label in script, target.label
+        assert "with multiple selections allowed" in script
+        assert "default items" in script
 
 
 if __name__ == "__main__":

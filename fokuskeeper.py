@@ -22,7 +22,7 @@ QUIET_PERIOD_MINUTES = 60  # skip the prompt if this app hasn't been used in thi
 LOG_FILE = Path.home() / "Library/Logs/fokuskeeper.log"
 STATE_FILE = Path.home() / ".fokuskeeper-state.json"
 HISTORY_FILE = Path.home() / ".fokuskeeper-history.json"
-CONFIG_FILE = Path.home() / ".fokuskeeper-config.json"  # reserved for the TARGETS config (U3)
+CONFIG_FILE = Path.home() / ".fokuskeeper-config.json"  # {"enabled": [target keys]}
 
 # Pre-rename paths. Kept so migrate_legacy_files() can copy an existing
 # installation's data across; the legacy files stay in place as rollback.
@@ -58,13 +58,62 @@ TARGET_KEYS = tuple(t.key for t in TARGETS)
 TARGET_LABELS = {t.key: t.label for t in TARGETS}
 
 
+# Config cache for load_enabled_targets(). The daemon calls the seam every
+# 0.5s tick, so we stat CONFIG_FILE (cheap) and only re-parse when the mtime
+# changes — which also picks up `fokuskeeper setup` edits from another process
+# without a restart. Keyed on (path, mtime_ns) so tests patching CONFIG_FILE
+# never see a stale entry.
+_config_cache = {"path": None, "mtime_ns": None, "targets": TARGETS}
+
+
+def _parse_enabled_config(path):
+    """Parse CONFIG_FILE into a tuple of enabled Targets, in TARGETS order.
+
+    Expected shape: {"enabled": ["slack", "gmail", ...]}. Unknown keys are
+    silently ignored. Any deviation — unreadable file, corrupt JSON, wrong
+    shape, empty/missing "enabled" list, or nothing left after filtering —
+    falls back to ALL targets (all-enabled is the default). Never raises.
+    """
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return TARGETS
+    if not isinstance(data, dict):
+        return TARGETS
+    enabled = data.get("enabled")
+    if not isinstance(enabled, list) or not enabled:
+        return TARGETS
+    keys = {k for k in enabled if isinstance(k, str)}
+    targets = tuple(t for t in TARGETS if t.key in keys)
+    return targets or TARGETS
+
+
+def load_enabled_targets():
+    """Read the enabled-target set from CONFIG_FILE, mtime-cached."""
+    global _config_cache
+    path = CONFIG_FILE
+    try:
+        mtime_ns = os.stat(path).st_mtime_ns
+    except OSError:
+        # File absent (or unstatable): all-enabled default.
+        return TARGETS
+    cache = _config_cache
+    if cache["path"] == path and cache["mtime_ns"] == mtime_ns:
+        return cache["targets"]
+    targets = _parse_enabled_config(path)
+    _config_cache = {"path": path, "mtime_ns": mtime_ns, "targets": targets}
+    return targets
+
+
 def enabled_targets():
     """The targets the daemon currently intercepts.
 
-    Seam for a later config unit (CONFIG_FILE); all matching must go through
-    here, never through TARGETS directly.
+    The seam all app/URL matching consults — never TARGETS directly. Backed
+    by CONFIG_FILE via load_enabled_targets(); stats/history/report keep
+    iterating ALL targets so disabled ones still show historical counts.
     """
-    return TARGETS
+    return load_enabled_targets()
 
 
 def match_app_name(app_name):
@@ -997,6 +1046,79 @@ def cmd_report():
     print(f"  Total opens: {total_opened}")
     print(f"  Total blocked: {total_prevented}")
 
+def save_config(config):
+    """Write CONFIG_FILE with user-only permissions (save_state pattern)."""
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+def run_setup():
+    """Show the native multi-select target chooser and write CONFIG_FILE.
+
+    Returns the list of enabled keys written, or None when nothing was
+    written (user cancelled, or osascript failed e.g. headless). On cancel
+    the existing config is left untouched; if none exists, none is written,
+    so the all-enabled default applies.
+    """
+    # Labels are trusted module constants, but the invariant is that
+    # EVERYTHING interpolated into osascript passes through
+    # sanitize_for_applescript.
+    items = ", ".join(
+        f'"{sanitize_for_applescript(t.label)}"' for t in TARGETS
+    )
+    script = (
+        f"choose from list {{{items}}} "
+        f'with title "FokusKeeper" '
+        f'with prompt "Which distractions should FokusKeeper gate? '
+        f"All are selected - deselect any you want ungated. "
+        f'(Cmd-click to toggle)" '
+        f"default items {{{items}}} "
+        f"with multiple selections allowed"
+    )
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        # osascript unavailable/failed (e.g. headless) — treat as cancel.
+        log("Setup chooser failed (osascript error) - config left untouched")
+        return None
+
+    output = result.stdout.strip()
+    if output == "false":
+        # The literal "false" is what `choose from list` prints on Cancel.
+        log("Setup cancelled - config left untouched")
+        return None
+
+    # osascript prints the chosen labels comma-separated. None of our labels
+    # contain a comma, so a plain split is unambiguous.
+    chosen = {label.strip() for label in output.split(",")}
+    enabled = [t.key for t in TARGETS if t.label in chosen]  # TARGETS order
+    save_config({"enabled": enabled})
+    log(f"Setup saved: enabled targets = {', '.join(enabled) or 'none'}")
+    return enabled
+
+
+def cmd_setup():
+    """`fokuskeeper setup`: run the chooser, then print the enabled set."""
+    run_setup()
+    labels = ", ".join(t.label for t in enabled_targets())
+    print(f"Enabled targets: {labels}")
+
+
+def cmd_run():
+    """`fokuskeeper run`: first-run setup chooser, then the monitor loop."""
+    if not CONFIG_FILE.exists():
+        run_setup()
+    monitor()
+
+
 def cmd_reset():
     """Zero today's counters, preserving the cooldown/quiet-period clocks."""
     state = load_state()
@@ -1019,10 +1141,12 @@ def main(argv=None):
         "command",
         nargs="?",
         default="run",
-        choices=["run", "stats", "status", "history", "report", "reset"],
+        choices=["run", "stats", "status", "history", "report", "reset",
+                 "setup"],
         help="run: start the monitor daemon (default); stats: today's numbers; "
              "status: daemon liveness + stats; history: last 7 days; "
-             "report: all-time totals; reset: zero today's counters",
+             "report: all-time totals; reset: zero today's counters; "
+             "setup: choose which targets to gate",
     )
     args = parser.parse_args(argv)
 
@@ -1031,12 +1155,13 @@ def main(argv=None):
     migrate_legacy_files()
 
     dispatch = {
-        "run": monitor,
+        "run": cmd_run,
         "stats": cmd_stats,
         "status": cmd_status,
         "history": cmd_history,
         "report": cmd_report,
         "reset": cmd_reset,
+        "setup": cmd_setup,
     }
     dispatch[args.command]()
 
