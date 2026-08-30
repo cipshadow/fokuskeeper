@@ -471,12 +471,27 @@ def get_frontmost_app():
     result = _run(["osascript", "-e", script])
     if result.returncode == 0:
         return result.stdout.strip()
+    _warn_access_once(
+        "frontmost",
+        "Cannot read the frontmost app - app-surface gating (Slack, WhatsApp) is "
+        "inactive. Grant Automation permission for System Events to the app that "
+        f"starts FokusKeeper ({result.stderr.strip() or 'unknown osascript error'}).",
+    )
     return None
 
 def quit_app(app_name):
-    """Quit a macOS application by name."""
-    _run(["osascript", "-e", f'quit app "{sanitize_for_applescript(app_name)}"'])
-    log(f"Quit {app_name}")
+    """Quit a macOS application by name. Only logs success when it actually happened."""
+    result = _run(["osascript", "-e", f'quit app "{sanitize_for_applescript(app_name)}"'])
+    if result.returncode == 0:
+        log(f"Quit {app_name}")
+        return True
+    _warn_access_once(
+        f"quit:{app_name}",
+        f"Cannot quit {app_name} - it will keep running after a denied distraction. "
+        f"Grant Automation permission for {app_name} to the app that starts FokusKeeper "
+        f"({result.stderr.strip() or 'unknown osascript error'}).",
+    )
+    return False
 
 def get_chrome_active_tab_url():
     """Get the URL of the active tab in Chrome."""
@@ -496,24 +511,30 @@ def get_chrome_active_tab_url():
     result = _run(["osascript", "-e", script])
     if result.returncode == 0:
         return result.stdout.strip()
-    _warn_chrome_access_once(result.stderr.strip())
+    _warn_access_once(
+        "chrome_tabs",
+        "Cannot read Chrome tabs - web gating is inactive. Grant Automation "
+        f"permission for Google Chrome to the app that starts FokusKeeper "
+        f"({result.stderr.strip() or 'unknown osascript error'}).",
+    )
     return ""
 
-_chrome_access_warned = False
+_access_warned = set()
 
-def _warn_chrome_access_once(stderr_text):
-    """Log the first Chrome-osascript failure so web gating never dies silently.
+def _warn_access_once(key, message):
+    """Log the first automation failure for a given key, once per process lifetime.
 
     The classic cause is a missing per-app Automation grant (TCC error -1743)
-    for whatever process launched the daemon — without this line the web
-    surface just stops working with no trace.
+    for whatever process launched the daemon. Without this, an affected
+    surface (frontmost-app detection, Chrome tab reading, quitting an app)
+    just silently stops working — this is what makes that diagnosable.
+    Keyed so independent grants (e.g. System Events vs. a specific app) each
+    get their own one-time warning instead of one hiding the rest.
     """
-    global _chrome_access_warned
-    if _chrome_access_warned:
+    if key in _access_warned:
         return
-    _chrome_access_warned = True
-    log(f"WARNING: cannot read Chrome tabs - web gating inactive ({stderr_text or 'unknown osascript error'}). "
-        "Grant Automation permission for Google Chrome to the app that starts FokusKeeper.")
+    _access_warned.add(key)
+    log(f"WARNING: {message} Check the Permissions section of the README.")
 
 def get_chrome_front_tab_ref():
     """Identify the front Chrome window and its active tab by ID.
