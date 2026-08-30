@@ -9,7 +9,6 @@ First public release.
 - First-run native chooser to pick which targets to gate; re-run anytime with `fokuskeeper setup`; config changes apply live.
 - Per-target 3-minute cooldown shared between a target's app and web surfaces; first-open-of-the-day and 60-minute quiet-period auto-allows.
 - Stats CLI: `stats`, `history`, `report`, `reset`, plus `start`/`stop`/`restart`/`status`/`logs` process commands.
-- `install.sh` builds a `~/Applications/FokusKeeper.app` login-item launcher (optional Desktop control panel); `uninstall.sh` with `--purge`.
-- Optional menu bar status icon (`rumps`, the only dependency).
+- `install.sh` sets up a menu bar status icon by default (shield-with-K, dims when stopped) and builds a `~/Applications/FokusKeeper.app` login launcher that runs it; falls back to a headless daemon if the menu bar's one dependency (`rumps`) can't install. Optional Desktop control panel; `uninstall.sh` with `--purge`.
 - Automatic migration of legacy `~/.slack-gatekeeper-*.json` state and history files (copied, originals kept).
 - Everything stays on the machine: state, history, config, and logs in the home directory with `chmod 600`, no telemetry.

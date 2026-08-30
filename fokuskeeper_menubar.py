@@ -154,6 +154,13 @@ class FokusKeeperStatusApp(rumps.App):
         self.toggle_item = rumps.MenuItem("Start FokusKeeper", callback=self.toggle)
         self.menu = [self.toggle_item]
 
+        # The menu bar icon is now the default entry point (install.sh's
+        # login launcher runs this, not the daemon directly), so launching
+        # it must actually turn gating on -- not just show a stopped icon
+        # waiting for a manual click nobody asked for.
+        if not is_running():
+            start_daemon()
+
         self.tick(None)
         self.timer = rumps.Timer(self.tick, POLL_SECONDS)
         self.timer.start()
