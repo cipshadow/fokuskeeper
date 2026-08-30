@@ -77,6 +77,7 @@ echo ""
 # Step 3: Optional Desktop control panel
 if [ "$1" = "--with-control-panel" ]; then
     echo "[3/4] Writing Desktop control panel..."
+    mkdir -p "$HOME/Desktop"
     cat > "$HOME/Desktop/FOKUSKEEPER.command" << EOF
 #!/bin/bash
 # FokusKeeper control panel — thin wrapper around the fokuskeeper CLI.
