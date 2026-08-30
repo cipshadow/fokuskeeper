@@ -3,6 +3,7 @@
 Unit tests for FokusKeeper functionality.
 Focus on testing the new dialog logic without requiring macOS dependencies.
 """
+import os
 import pytest
 from unittest.mock import patch, MagicMock
 import subprocess
@@ -418,7 +419,24 @@ class TestTargetConfig:
         assert sg.TARGET_LABELS["gmail"] == "Gmail"
 
 
-class TestAppMatching:
+class _HermeticConfigMixin:
+    """Point CONFIG_FILE at a nonexistent path for every test in the class.
+
+    match_app_name/match_url resolve enabled_targets() from CONFIG_FILE when
+    called without an explicit targets arg. Without this patch they would read
+    the machine's REAL ~/.fokuskeeper-config.json, and the suite would break on
+    any machine whose config disables a target. Absent config = all enabled.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self):
+        temp_dir = Path(tempfile.mkdtemp())
+        with patch.object(sg, 'CONFIG_FILE', temp_dir / "no-such-config.json"):
+            yield
+        temp_dir.rmdir()
+
+
+class TestAppMatching(_HermeticConfigMixin):
     """Frontmost-app matching is exact on app_name."""
 
     def test_whatsapp_exact_name_matches(self):
@@ -437,7 +455,7 @@ class TestAppMatching:
         assert sg.match_app_name("") is None
 
 
-class TestUrlMatching:
+class TestUrlMatching(_HermeticConfigMixin):
     """URL matching is hostname-suffix, not substring."""
 
     CASES = [
@@ -796,6 +814,276 @@ class TestRunSetup(_TempConfigMixin):
             assert target.label in script, target.label
         assert "with multiple selections allowed" in script
         assert "default items" in script
+
+
+class _RecordingSurface:
+    """Stub surface that records block/restore/discard calls in order."""
+
+    def __init__(self):
+        self.calls = []
+
+    def block(self):
+        self.calls.append("block")
+
+    def restore(self):
+        self.calls.append("restore")
+
+    def discard(self):
+        self.calls.append("discard")
+
+
+class TestHandleIntercept(_TempStateMixin):
+    """handle_intercept(): gate-to-action orchestration, all five branches."""
+
+    def setup_method(self):
+        super().setup_method()
+        self.surface = _RecordingSurface()
+        self.target = sg.TARGETS_BY_KEY["slack"]
+
+    def _intercept(self, seed_state=None, dialog=None):
+        """Run handle_intercept hermetically; returns (allowed, mock_dialog)."""
+        patches = self._patches() + [
+            patch.object(sg, 'CONFIG_FILE', self.temp_dir / "no-config.json"),
+            patch.object(sg.time, 'sleep'),  # skip the 0.3s block settle
+        ]
+        for p in patches:
+            p.start()
+        try:
+            if seed_state is not None:
+                sg.save_state(seed_state)
+            with patch.object(sg, 'show_confirmation_dialog',
+                              return_value=dialog) as mock_dialog:
+                allowed = sg.handle_intercept(self.target, self.surface)
+            return allowed, mock_dialog
+        finally:
+            for p in patches:
+                p.stop()
+
+    def _state(self):
+        return json.loads(self.state_file.read_text())
+
+    @staticmethod
+    def _recent(iso_value):
+        return (datetime.now()
+                - datetime.fromisoformat(iso_value)).total_seconds() < 5
+
+    def _prompt_seed(self):
+        """opens>0, recent last_seen, expired (absent) cooldown → Gate.PROMPT."""
+        return {
+            "stats_date": sg.get_today_date(),
+            "slack_opens": 2,
+            "slack_last_seen": (datetime.now()
+                                - timedelta(minutes=1)).isoformat(),
+        }
+
+    def test_cooldown_allows_silently_and_refreshes_last_seen(self):
+        seed = {"slack_granted_at": datetime.now().isoformat()}
+        allowed, mock_dialog = self._intercept(seed)
+
+        assert allowed is True
+        assert mock_dialog.called is False
+        assert self.surface.calls == []          # no block
+        state = self._state()
+        assert state.get("slack_opens", 0) == 0  # not counted
+        assert "slack_granted_at" in state       # cooldown clock untouched
+        assert self._recent(state["slack_last_seen"])  # glance recorded
+
+    def test_first_open_auto_allows_counts_and_grants_cooldown(self):
+        allowed, mock_dialog = self._intercept()  # zero opens today
+
+        assert allowed is True
+        assert mock_dialog.called is False
+        assert self.surface.calls == []
+        state = self._state()
+        assert state["slack_opens"] == 1
+        assert self._recent(state["slack_granted_at"])  # cooldown granted
+
+    def test_quiet_period_auto_allows_counts_and_grants_cooldown(self):
+        seed = {
+            "stats_date": sg.get_today_date(),
+            "slack_opens": 2,
+            "slack_last_seen": (datetime.now() - timedelta(
+                minutes=sg.QUIET_PERIOD_MINUTES + 5)).isoformat(),
+        }
+        allowed, mock_dialog = self._intercept(seed)
+
+        assert allowed is True
+        assert mock_dialog.called is False
+        assert self.surface.calls == []
+        state = self._state()
+        assert state["slack_opens"] == 3
+        assert self._recent(state["slack_granted_at"])
+
+    def test_prompt_allow_blocks_then_restores(self):
+        allowed, mock_dialog = self._intercept(self._prompt_seed(), dialog=True)
+
+        assert allowed is True
+        assert mock_dialog.call_count == 1
+        assert self.surface.calls == ["block", "restore"]
+        state = self._state()
+        assert state["slack_opens"] == 3
+        assert state.get("slack_prevented", 0) == 0
+        assert self._recent(state["slack_granted_at"])
+
+    def test_prompt_deny_blocks_then_discards(self):
+        allowed, mock_dialog = self._intercept(self._prompt_seed(), dialog=False)
+
+        assert allowed is False
+        assert mock_dialog.call_count == 1
+        assert self.surface.calls == ["block", "discard"]
+        state = self._state()
+        assert state["slack_opens"] == 2                  # not counted
+        assert state["slack_prevented"] == 1
+        assert "slack_granted_at" not in state            # no cooldown granted
+
+
+class TestRefreshLastSeen(_TempStateMixin):
+    """refresh_last_seen(): only the 15s staleness throttle gates the write.
+
+    Regression for the cooldown-predicate removal: continuous use past the
+    cooldown must still count as activity, or a long session reads as a
+    quiet period and the next open auto-allows.
+    """
+
+    def test_stale_last_seen_refreshes_even_after_cooldown_expired(self):
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            sg.save_state({
+                "slack_granted_at": (datetime.now() - timedelta(
+                    minutes=sg.COOLDOWN_MINUTES + 5)).isoformat(),
+                "slack_last_seen": (datetime.now() - timedelta(
+                    seconds=sg.LAST_SEEN_REFRESH_SECONDS + 10)).isoformat(),
+            })
+            assert sg.is_in_cooldown("slack") is False  # cooldown expired
+
+            sg.refresh_last_seen("slack")
+
+            last_seen = datetime.fromisoformat(
+                sg.load_state()["slack_last_seen"])
+            assert (datetime.now() - last_seen).total_seconds() < 5
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_fresh_last_seen_is_not_rewritten(self):
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            fresh = (datetime.now() - timedelta(seconds=5)).isoformat()
+            sg.save_state({"slack_last_seen": fresh})
+
+            sg.refresh_last_seen("slack")
+
+            assert sg.load_state()["slack_last_seen"] == fresh  # no write
+        finally:
+            for p in patches:
+                p.stop()
+
+
+class TestWriteJsonFileAtomic:
+    """_write_json_file(): atomic replace, no tmp residue, 0o600 from creation."""
+
+    def setup_method(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def test_write_leaves_no_tmp_sets_mode_and_parses(self):
+        path = self.temp_dir / "state.json"
+        sg._write_json_file(path, {"slack_opens": 3})
+
+        assert json.loads(path.read_text()) == {"slack_opens": 3}
+        assert (path.stat().st_mode & 0o777) == 0o600
+        leftovers = [p.name for p in self.temp_dir.iterdir()
+                     if p.name.endswith(".tmp")]
+        assert leftovers == []
+
+    def test_overwrite_is_atomic_too(self):
+        path = self.temp_dir / "state.json"
+        sg._write_json_file(path, {"v": 1})
+        sg._write_json_file(path, {"v": 2})
+
+        assert json.loads(path.read_text()) == {"v": 2}
+        assert (path.stat().st_mode & 0o777) == 0o600
+        assert [p.name for p in self.temp_dir.iterdir()] == ["state.json"]
+
+
+class TestLoadStateCorrupt(_TempStateMixin):
+    """load_state(): a corrupt state file degrades to {} instead of raising."""
+
+    def test_corrupt_json_returns_empty_dict(self):
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            self.state_file.write_text("{not json!!")
+            assert sg.load_state() == {}
+        finally:
+            for p in patches:
+                p.stop()
+
+
+class TestCmdRunDoubleStartGuard:
+    """cmd_run(): refuses to start when another daemon pid matches the pattern."""
+
+    def setup_method(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.config_file = self.temp_dir / "config.json"
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def _cmd_run(self, pgrep_stdout):
+        fake = subprocess.CompletedProcess(
+            ["pgrep", "-f", sg.DAEMON_PROCESS_PATTERN],
+            returncode=0 if pgrep_stdout.strip() else 1,
+            stdout=pgrep_stdout, stderr="")
+        with patch.object(sg, '_run', return_value=fake), \
+             patch.object(sg, 'monitor') as mock_monitor, \
+             patch.object(sg, 'run_setup') as mock_setup, \
+             patch.object(sg, 'CONFIG_FILE', self.config_file), \
+             patch.object(sg, 'log'):
+            sg.cmd_run()
+        return mock_monitor, mock_setup
+
+    def test_foreign_pid_refuses_to_start(self, capsys):
+        # A pid that is neither this process nor its parent.
+        foreign = str(os.getpid() + 100000)
+        mock_monitor, _ = self._cmd_run(f"{foreign}\n{os.getpid()}\n")
+
+        assert mock_monitor.called is False
+        assert "already running" in capsys.readouterr().out
+
+    def test_own_and_parent_pids_are_discarded(self):
+        # pgrep sees this test process and its parent — not a foreign daemon.
+        self.config_file.write_text(json.dumps({"enabled": ["slack"]}))
+        mock_monitor, mock_setup = self._cmd_run(
+            f"{os.getpid()}\n{os.getppid()}\n")
+
+        assert mock_monitor.called is True
+        assert mock_setup.called is False  # config exists, no chooser
+
+
+class TestRunTimeout:
+    """_run(): a TimeoutExpired becomes the returncode-1 failure sentinel."""
+
+    def test_timeout_returns_failure_sentinel(self):
+        def raise_timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=["osascript", "-e"], timeout=10)
+
+        with patch.object(sg.subprocess, 'run', side_effect=raise_timeout), \
+             patch.object(sg, 'log') as mock_log:
+            result = sg._run(["osascript", "-e", "beep"])
+
+        assert result.returncode == 1
+        assert result.stdout == ""
+        assert mock_log.called  # the timeout is logged, not swallowed
 
 
 if __name__ == "__main__":

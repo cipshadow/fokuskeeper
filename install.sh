@@ -21,6 +21,11 @@ INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Installation directory: $INSTALL_DIR"
 echo ""
 
+# Shell-escaped form of INSTALL_DIR for safe interpolation into generated
+# launcher scripts below. %q produces output that is already quoted for
+# reuse as shell input, so it must be used UNQUOTED wherever it appears.
+Q_DIR=$(printf '%q' "$INSTALL_DIR")
+
 # Step 1: Make scripts executable
 echo "[1/4] Making scripts executable..."
 chmod +x "$INSTALL_DIR/fokuskeeper.py"
@@ -36,9 +41,9 @@ mkdir -p "$APP_PATH/Contents/MacOS"
 
 cat > "$APP_PATH/Contents/MacOS/run" << EOF
 #!/bin/bash
-cd "$INSTALL_DIR"
-if [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
-    PY="$INSTALL_DIR/.venv/bin/python3"
+cd $Q_DIR
+if [ -x $Q_DIR/.venv/bin/python3 ]; then
+    PY=$Q_DIR/.venv/bin/python3
 else
     PY="python3"
 fi
@@ -75,7 +80,7 @@ if [ "$1" = "--with-control-panel" ]; then
     cat > "$HOME/Desktop/FOKUSKEEPER.command" << EOF
 #!/bin/bash
 # FokusKeeper control panel — thin wrapper around the fokuskeeper CLI.
-FK="$INSTALL_DIR/fokuskeeper"
+FK=$Q_DIR/fokuskeeper
 
 if pgrep -f 'python.*fokuskeeper.py' > /dev/null; then
     STATUS="ACTIVE"

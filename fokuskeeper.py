@@ -9,6 +9,7 @@ import time
 import subprocess
 import json
 import fcntl
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -20,6 +21,11 @@ CHROME_APP_NAME = "Google Chrome"
 # pgrep/pkill pattern for the daemon process. Deliberately `python.*` + script
 # name so an editor session with the file open never matches.
 DAEMON_PROCESS_PATTERN = "python.*fokuskeeper.py"
+# Timeouts so a hung osascript (e.g. a pending TCC prompt) can't freeze the
+# single-threaded monitor loop forever. Dialogs legitimately wait on a human,
+# so they get a much longer budget.
+SUBPROCESS_TIMEOUT_SECONDS = 10
+DIALOG_TIMEOUT_SECONDS = 600
 COOLDOWN_MINUTES = 3
 QUIET_PERIOD_MINUTES = 60  # skip the prompt if this app hasn't been used in this long
 LOG_FILE = Path.home() / "Library/Logs/fokuskeeper.log"
@@ -192,6 +198,21 @@ def log(message):
         with open(LOG_FILE, "a") as f:
             f.write(log_entry)
 
+def _run(cmd, timeout=SUBPROCESS_TIMEOUT_SECONDS):
+    """subprocess.run with capture_output/text and a timeout.
+
+    On timeout, logs and returns a CompletedProcess with returncode 1 and
+    empty output, so every call site falls into its existing non-zero
+    returncode failure path (None / "" / (None, None) / False / cancel).
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"Command timed out after {timeout}s: {' '.join(cmd[:2])}")
+        return subprocess.CompletedProcess(
+            cmd, returncode=1, stdout="", stderr=f"timed out after {timeout}s"
+        )
+
 def migrate_legacy_files():
     """Copy pre-rename state/history files to the new paths, once.
 
@@ -206,8 +227,11 @@ def migrate_legacy_files():
         if new_file.exists() or not legacy_file.exists():
             continue
         new_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(legacy_file, new_file)
-        os.chmod(new_file, 0o600)
+        # Create the destination 0o600 BEFORE writing content, so the data
+        # is never world-readable even briefly (copyfile+chmod would be).
+        fd = os.open(new_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as dst, open(legacy_file, "rb") as src:
+            shutil.copyfileobj(src, dst)
         log(f"Migrated legacy file {legacy_file} -> {new_file}")
 
 def load_state():
@@ -216,24 +240,37 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
-        except:
+        except (json.JSONDecodeError, ValueError, OSError):
+            try:
+                log(f"State file unreadable/corrupt - treating as empty: {STATE_FILE}")
+            except Exception:
+                pass  # a logging failure must not crash state loading
             return {}
     return {}
 
 def _write_json_file(path, data, lock=False):
-    """Write JSON with user-only permissions; optionally under an exclusive lock."""
+    """Atomically write JSON with user-only permissions from creation.
+
+    Writes to a same-directory temp file created 0o600, fsyncs, then
+    os.replace()s it over path — readers never see a partial or
+    world-readable file. The lock parameter is kept for signature
+    stability; the atomic replace makes an flock unnecessary.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        try:
-            if lock:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        finally:
-            if lock:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-    os.chmod(path, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 def save_state(state):
     """Save state to file with file locking."""
@@ -298,9 +335,11 @@ def increment_prevented_count(app_type="slack"):
 def save_to_history(event_type):
     """Save event to historical log file with file locking."""
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Use file locking to prevent race conditions
-    with open(HISTORY_FILE, "a+") as f:
+
+    # Create 0o600 from the start so the file is never world-readable, then
+    # use file locking to prevent race conditions ("a+" semantics as before).
+    fd = os.open(HISTORY_FILE, os.O_CREAT | os.O_RDWR | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a+") as f:
         try:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # Exclusive lock
             
@@ -343,13 +382,13 @@ def get_daily_count(app_type="slack"):
     return 0
 
 def get_prevented_count(app_type="slack"):
-    """Get today's distractions prevented count for specified app."""
-    state = load_state()
-    today = get_today_date()
+    """Get today's distractions prevented count for specified app.
 
-    if state.get("stats_date") == today:
-        return state.get(f"{app_type}_prevented", 0)
-    return 0
+    Delegates to _today_counters (defined later; resolved at call time) so
+    the legacy slack-only distractions_prevented fallback applies here too.
+    """
+    counters = _today_counters(load_state())
+    return counters.get(app_type, (0, 0))[1]
 
 # Cooldown and quiet period are two different clocks and must not share a key.
 #
@@ -389,16 +428,18 @@ def update_last_seen(app_type="slack"):
 
 # The quiet-period threshold is minutes-scale, so last_seen only needs coarse
 # freshness — refreshing at most every LAST_SEEN_REFRESH_SECONDS avoids an
-# fsync'd state write on every 0.5s poll tick during a cooldown.
+# fsync'd state write on every 0.5s poll tick during continued use.
 LAST_SEEN_REFRESH_SECONDS = 15
 
 def refresh_last_seen(app_type):
-    """Refresh last_seen while in cooldown, but only when it has gone stale."""
+    """Refresh last_seen during continued use, but only when it has gone stale.
+
+    Runs regardless of cooldown state: continuous use past the cooldown must
+    still count as activity, or a long session would read as a quiet period
+    and the next open would auto-allow.
+    """
     state = load_state()
     now = datetime.now()
-    granted_at = _read_clock(state, app_type, "granted_at")
-    if granted_at is None or now - granted_at >= timedelta(minutes=COOLDOWN_MINUTES):
-        return  # not in cooldown — same predicate the monitor loop used before
     last_seen = _read_clock(state, app_type, "last_seen")
     if last_seen is not None and (now - last_seen).total_seconds() < LAST_SEEN_REFRESH_SECONDS:
         return
@@ -421,31 +462,20 @@ def is_quiet_period(app_type="slack"):
 
 def is_app_running(app_name):
     """Check if an app's process is currently running (exact process name)."""
-    result = subprocess.run(
-        ["pgrep", "-x", app_name],
-        capture_output=True,
-        text=True
-    )
+    result = _run(["pgrep", "-x", app_name])
     return result.returncode == 0
 
 def get_frontmost_app():
     """Get the name of the currently active/frontmost application."""
     script = 'tell application "System Events" to return name of first application process whose frontmost is true'
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True
-    )
+    result = _run(["osascript", "-e", script])
     if result.returncode == 0:
         return result.stdout.strip()
     return None
 
 def quit_app(app_name):
     """Quit a macOS application by name."""
-    subprocess.run(
-        ["osascript", "-e", f'quit app "{sanitize_for_applescript(app_name)}"'],
-        capture_output=True
-    )
+    _run(["osascript", "-e", f'quit app "{sanitize_for_applescript(app_name)}"'])
     log(f"Quit {app_name}")
 
 def get_chrome_active_tab_url():
@@ -463,11 +493,7 @@ def get_chrome_active_tab_url():
         end if
     end tell
     '''
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True
-    )
+    result = _run(["osascript", "-e", script])
     if result.returncode == 0:
         return result.stdout.strip()
     _warn_chrome_access_once(result.stderr.strip())
@@ -513,11 +539,7 @@ def get_chrome_front_tab_ref():
         end if
     end tell
     '''
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True
-    )
+    result = _run(["osascript", "-e", script])
     if result.returncode != 0:
         return (None, None)
     parts = result.stdout.strip().split("|")
@@ -560,11 +582,7 @@ def _tell_tab(window_id, tab_id, body):
         end try
     end tell
     '''
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True
-    )
+    result = _run(["osascript", "-e", script])
     output = result.stdout.strip()
     if output == "ok":
         return True
@@ -637,7 +655,7 @@ class AppSurface:
         quit_app(self.target.app_name)
 
     def restore(self):
-        subprocess.run(["open", "-a", self.target.app_name])
+        _run(["open", "-a", self.target.app_name])
 
     def discard(self):
         pass  # the app is already quit; nothing to clean up
@@ -810,11 +828,9 @@ def show_confirmation_dialog(target):
     return clickedButton
     '''
 
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True
-    )
+    # A timeout returns returncode 1 (logged by _run), which lands in the
+    # same dialog-closed/ESC branch below — treated as "Stay focused".
+    result = _run(["osascript", "-e", script], timeout=DIALOG_TIMEOUT_SECONDS)
 
     allowed = parse_dialog_button(result.returncode, result.stdout)
     if allowed:
@@ -861,7 +877,8 @@ def monitor():
     print()
     print(f"⏰ COOLDOWN PERIOD: {COOLDOWN_MINUTES} minutes")
     print(f"  After clicking 'I have a reason', you get {COOLDOWN_MINUTES} minutes of")
-    print("  uninterrupted access. Timer starts when you STOP using the app.")
+    print("  uninterrupted access. The timer starts at the grant and is not")
+    print("  extended by continued use.")
     print()
     print(f"🤫 QUIET PERIOD: {QUIET_PERIOD_MINUTES} minutes")
     print(f"  If a target hasn't been used in {QUIET_PERIOD_MINUTES}+ minutes, the next")
@@ -891,55 +908,63 @@ def monitor():
 
     try:
         while True:
-            current_frontmost = get_frontmost_app()
-            targets = enabled_targets()  # one config stat per tick
+            try:
+                current_frontmost = get_frontmost_app()
+                targets = enabled_targets()  # one config stat per tick
 
-            # Check 1: app-surface targets (edge-triggered on focus change)
-            app_target = match_app_name(current_frontmost, targets)
-            if app_target is not None and app_target.key != last_app_key:
-                log(f"{app_target.label} activated/focused")
-                allowed = handle_intercept(app_target, AppSurface(app_target))
-                if not allowed:
-                    # Reset edge keys so a missed target re-triggers on the
-                    # next focus change (the dialog stole focus meanwhile).
-                    last_app_key = None
-                    last_web_key = None
-                    continue
-                time.sleep(0.5)
-
-            # Track continued usage (refresh last_seen while in cooldown)
-            if app_target is not None:
-                refresh_last_seen(app_target.key)
-            last_app_key = app_target.key if app_target is not None else None
-
-            # Check 2: web-surface targets in Chrome (edge-triggered on tab URL)
-            if current_frontmost == CHROME_APP_NAME:
-                chrome_url = get_chrome_active_tab_url()
-                web_target = match_url(chrome_url, targets)
-
-                if web_target is not None and web_target.key != last_web_key:
-                    log(f"{web_target.label} tab activated: {chrome_url}")
-                    # Pin the exact tab so it can be restored into its own
-                    # profile. Ids come ONLY from get_chrome_front_tab_ref.
-                    window_id, tab_id = get_chrome_front_tab_ref()
-                    surface = WebSurface(web_target, window_id, tab_id, chrome_url)
-                    allowed = handle_intercept(web_target, surface)
+                # Check 1: app-surface targets (edge-triggered on focus change)
+                app_target = match_app_name(current_frontmost, targets)
+                if app_target is not None and app_target.key != last_app_key:
+                    log(f"{app_target.label} activated/focused")
+                    allowed = handle_intercept(app_target, AppSurface(app_target))
                     if not allowed:
                         # Reset edge keys so a missed target re-triggers on the
-                        # next focus change.
-                        last_web_key = None
+                        # next focus change (the dialog stole focus meanwhile).
                         last_app_key = None
+                        last_web_key = None
                         continue
                     time.sleep(0.5)
 
-                # Track continued usage (refresh last_seen while in cooldown)
-                if web_target is not None:
-                    refresh_last_seen(web_target.key)
-                last_web_key = web_target.key if web_target is not None else None
-            else:
-                last_web_key = None
+                # Track continued usage (refresh last_seen on continued use)
+                if app_target is not None:
+                    refresh_last_seen(app_target.key)
+                last_app_key = app_target.key if app_target is not None else None
 
-            time.sleep(0.5)  # Check twice per second
+                # Check 2: web-surface targets in Chrome (edge-triggered on tab URL)
+                if current_frontmost == CHROME_APP_NAME:
+                    chrome_url = get_chrome_active_tab_url()
+                    web_target = match_url(chrome_url, targets)
+
+                    if web_target is not None and web_target.key != last_web_key:
+                        log(f"{web_target.label} tab activated: {chrome_url}")
+                        # Pin the exact tab so it can be restored into its own
+                        # profile. Ids come ONLY from get_chrome_front_tab_ref.
+                        window_id, tab_id = get_chrome_front_tab_ref()
+                        surface = WebSurface(web_target, window_id, tab_id, chrome_url)
+                        allowed = handle_intercept(web_target, surface)
+                        if not allowed:
+                            # Reset edge keys so a missed target re-triggers on the
+                            # next focus change.
+                            last_web_key = None
+                            last_app_key = None
+                            continue
+                        time.sleep(0.5)
+
+                    # Track continued usage (refresh last_seen on continued use)
+                    if web_target is not None:
+                        refresh_last_seen(web_target.key)
+                    last_web_key = web_target.key if web_target is not None else None
+                else:
+                    last_web_key = None
+
+                time.sleep(0.5)  # Check twice per second
+            except Exception as e:
+                # Never let a transient failure kill the daemon silently.
+                # KeyboardInterrupt is not an Exception, so Ctrl+C still
+                # reaches the handler below.
+                log(f"Monitor loop error: {e}\n{traceback.format_exc()}")
+                time.sleep(2)
+                continue
 
     except KeyboardInterrupt:
         log("FokusKeeper stopped")
@@ -1008,11 +1033,7 @@ def cmd_stats():
 
 def cmd_status():
     """Print whether the daemon is running, plus today's stats."""
-    result = subprocess.run(
-        ["pgrep", "-f", DAEMON_PROCESS_PATTERN],
-        capture_output=True,
-        text=True
-    )
+    result = _run(["pgrep", "-f", DAEMON_PROCESS_PATTERN])
     pids = {p.strip() for p in result.stdout.split() if p.strip()}
     pids.discard(str(os.getpid()))  # this status invocation matches the pattern too
     if pids:
@@ -1109,20 +1130,23 @@ def run_setup():
     items = ", ".join(
         f'"{sanitize_for_applescript(t.label)}"' for t in TARGETS
     )
+    # Pre-select the currently enabled set so re-running setup edits the
+    # existing selection. With no config, load_enabled_targets() returns all
+    # targets, so first-run behaviour is unchanged (everything selected).
+    default_items = ", ".join(
+        f'"{sanitize_for_applescript(t.label)}"' for t in load_enabled_targets()
+    )
     script = (
         f"choose from list {{{items}}} "
         f'with title "FokusKeeper" '
         f'with prompt "Which distractions should FokusKeeper gate? '
-        f"All are selected - deselect any you want ungated. "
+        f"Currently gated targets are selected. "
         f'(Cmd-click to toggle)" '
-        f"default items {{{items}}} "
+        f"default items {{{default_items}}} "
         f"with multiple selections allowed"
     )
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True
-    )
+    # A timeout returns returncode 1 (logged by _run) — treated as cancel.
+    result = _run(["osascript", "-e", script], timeout=DIALOG_TIMEOUT_SECONDS)
 
     if result.returncode != 0:
         # osascript unavailable/failed (e.g. headless) — treat as cancel.
@@ -1153,6 +1177,14 @@ def cmd_setup():
 
 def cmd_run():
     """`fokuskeeper run`: first-run setup chooser, then the monitor loop."""
+    # Double-start guard: refuse to run a second daemon.
+    result = _run(["pgrep", "-f", DAEMON_PROCESS_PATTERN])
+    pids = {p.strip() for p in result.stdout.split() if p.strip()}
+    pids.discard(str(os.getpid()))  # this invocation matches the pattern too
+    pids.discard(str(os.getppid()))  # so can a wrapper script's interpreter
+    if pids:
+        print(f"FokusKeeper daemon already running (pid {', '.join(sorted(pids))})")
+        return
     if not CONFIG_FILE.exists():
         run_setup()
     monitor()
