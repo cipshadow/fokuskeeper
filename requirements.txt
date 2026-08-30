@@ -1,0 +1,3 @@
+# Only needed for the optional menu bar app (fokuskeeper_menubar.py).
+# The daemon itself runs on the Python standard library alone.
+rumps>=0.4.0

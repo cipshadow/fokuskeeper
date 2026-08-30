@@ -2,8 +2,9 @@
 __pycache__/
 *.pyc
 .DS_Store
-.slack-gatekeeper-*.json
+.claude/
 .fokuskeeper-*.json
+.slack-gatekeeper-*.json
 FokusKeeper.app/
 *.command
-.claude/
+nohup.out
