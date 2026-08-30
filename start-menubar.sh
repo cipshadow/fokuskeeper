@@ -7,6 +7,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
 LOG_FILE="$HOME/Library/Logs/fokuskeeper-menubar.log"
+mkdir -p "$(dirname "$LOG_FILE")"
 
 if [ -x "$DIR/.venv/bin/python3" ]; then
   PY="$DIR/.venv/bin/python3"

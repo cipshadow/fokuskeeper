@@ -48,9 +48,9 @@ Cooldowns are shared per target across surfaces: allowing the Slack app also cov
 ## Prerequisites
 
 - macOS 12 or later
-- Python 3.9+ (stdlib only; the system `python3` works). A fresh Mac without developer tools will offer to install the Xcode Command Line Tools the first time you run `python3`; accept that, or `brew install python`.
+- Python 3.9+ (stdlib only for the daemon itself; the system `python3` works). A fresh Mac without developer tools will offer to install the Xcode Command Line Tools the first time you run `python3`; accept that, or `brew install python`.
 - Google Chrome, if you want web gating (the app surfaces work without it)
-- `rumps` only for the optional menu bar icon (see [Customization](#customization))
+- Internet access during install, to fetch `rumps` for the menu bar icon (see below — the daemon still works fine without it)
 
 ## Install
 
@@ -60,7 +60,9 @@ cd fokuskeeper
 ./install.sh
 ```
 
-The installer checks for `python3`, builds `~/Applications/FokusKeeper.app` (a background launcher, no Dock icon), and starts the daemon. Add the app to System Settings -> General -> Login Items to start it at login. Pass `--with-control-panel` to also get a `FOKUSKEEPER.command` start/stop/stats panel on your Desktop.
+The installer checks for `python3`, sets up a menu bar icon (a small `.venv` with `rumps`), builds `~/Applications/FokusKeeper.app` as the login launcher, and starts everything. Add the app to System Settings -> General -> Login Items to start it at login. Pass `--with-control-panel` to also get a `FOKUSKEEPER.command` start/stop/stats panel on your Desktop.
+
+If the menu bar setup can't complete (no network, or no build tools for one of its dependencies), install continues anyway with a plain headless daemon — no menu bar icon, but gating still works fully. Retry the menu bar setup any time with `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && ./start-menubar.sh`, then re-run `./install.sh` to regenerate the login launcher so it picks it up automatically.
 
 On first run a native chooser lists all ten targets, pre-selected; deselect any you want ungated. Your choice is saved to `~/.fokuskeeper-config.json`.
 
@@ -100,15 +102,7 @@ FokusKeeper - Today's stats (2026-08-30)
 
 - **Targets**: `./fokuskeeper setup` reopens the chooser. Changes apply live; the daemon watches the config file's mtime, no restart needed.
 - **Timing**: edit `COOLDOWN_MINUTES` (default 3) and `QUIET_PERIOD_MINUTES` (default 60) at the top of `fokuskeeper.py`, then restart the daemon. Deliberate v1 choice: these live in code, not a config file.
-- **Menu bar icon** (optional): a shield icon showing daemon state with a start/stop toggle. Needs `rumps`, the project's only dependency:
-
-  ```bash
-  python3 -m venv .venv
-  .venv/bin/pip install -r requirements.txt
-  ./start-menubar.sh
-  ```
-
-  `start-menubar.sh` prefers the repo's `.venv` automatically.
+- **Menu bar icon**: installed by default (see Install above). A shield-with-K icon shows daemon state; click it to start/stop. To start it manually without logging out and back in, run `./start-menubar.sh` — it prefers the repo's `.venv` automatically and starts the daemon itself if it isn't already running.
 
 ## Uninstall
 
