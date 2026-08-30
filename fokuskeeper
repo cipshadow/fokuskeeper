@@ -44,7 +44,11 @@ case "$1" in
             exit 1
         fi
         cd "$DIR" || exit 1
-        nohup "$PY" fokuskeeper.py run > "$STDOUT_LOG" 2>&1 &
+        # -u: unbuffered stdout, so the log fills in real time instead of
+        # sitting in Python's default block-buffer when redirected to a file
+        # (a fully-buffered-but-running daemon looks identical to a stuck
+        # one in `fokuskeeper logs` until enough output accumulates to flush).
+        nohup "$PY" -u fokuskeeper.py run > "$STDOUT_LOG" 2>&1 &
         sleep 1
         if is_running; then
             echo "FokusKeeper started."

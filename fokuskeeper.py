@@ -1176,7 +1176,20 @@ def cmd_setup():
 
 
 def cmd_run():
-    """`fokuskeeper run`: first-run setup chooser, then the monitor loop."""
+    """`fokuskeeper run`: the resident monitor loop. Never shows UI.
+
+    This command is launched backgrounded (nohup ... &) by the CLI and the
+    login-item launcher app, so it must not block on an interactive dialog —
+    a modal AppleScript prompt from a backgrounded, non-foreground process is
+    unreliable on macOS (TCC/window-server attribution is flaky outside a
+    normal foreground context) and was the actual cause of a real "daemon
+    never starts, log stays empty" report on a fresh account. First-run
+    target selection is a separate, explicit, foreground step: `install.sh`
+    runs `fokuskeeper setup` before ever starting the daemon, and it's
+    re-runnable any time via `fokuskeeper setup`. With no config at all,
+    enabled_targets() already defaults to all targets, so skipping the
+    chooser here is a safe fallback, not a degraded one.
+    """
     # Double-start guard: refuse to run a second daemon.
     result = _run(["pgrep", "-f", DAEMON_PROCESS_PATTERN])
     pids = {p.strip() for p in result.stdout.split() if p.strip()}
@@ -1185,8 +1198,6 @@ def cmd_run():
     if pids:
         print(f"FokusKeeper daemon already running (pid {', '.join(sorted(pids))})")
         return
-    if not CONFIG_FILE.exists():
-        run_setup()
     monitor()
 
 

@@ -1069,6 +1069,18 @@ class TestCmdRunDoubleStartGuard:
         assert mock_monitor.called is True
         assert mock_setup.called is False  # config exists, no chooser
 
+    def test_missing_config_still_goes_straight_to_monitor(self):
+        # cmd_run() must never show UI itself, even with no config at all —
+        # a blocking chooser inside the backgrounded/nohup'd daemon process
+        # is what caused a real "daemon never starts, log stays empty"
+        # failure on a fresh account. First-run setup is install.sh's job,
+        # run in the foreground before the daemon ever starts.
+        assert not self.config_file.exists()
+        mock_monitor, mock_setup = self._cmd_run(f"{os.getpid()}\n")
+
+        assert mock_monitor.called is True
+        assert mock_setup.called is False
+
 
 class TestRunTimeout:
     """_run(): a TimeoutExpired becomes the returncode-1 failure sentinel."""
