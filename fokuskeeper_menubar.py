@@ -102,8 +102,12 @@ def _shield_k_image(on):
 
 
 def is_running():
+    # -u str(os.getuid()): on a shared Mac (Fast User Switching or multiple
+    # real accounts), pgrep -f alone matches ANY user's daemon -- another
+    # account's FokusKeeper would make this one falsely report running.
     result = subprocess.run(
-        ["pgrep", "-f", PROCESS_PATTERN], capture_output=True, text=True
+        ["pgrep", "-f", "-u", str(os.getuid()), PROCESS_PATTERN],
+        capture_output=True, text=True,
     )
     return result.returncode == 0
 
@@ -142,8 +146,14 @@ def start_daemon():
 
 
 def stop_daemon():
-    """pkill regardless of who started it; no KeepAlive means it stays down."""
-    subprocess.run(["pkill", "-f", PROCESS_PATTERN], capture_output=True, text=True)
+    """pkill regardless of how it was started (launchd vs. direct spawn); no
+    KeepAlive means it stays down. Scoped to this user, not other accounts'
+    processes -- see is_running().
+    """
+    subprocess.run(
+        ["pkill", "-f", "-u", str(os.getuid()), PROCESS_PATTERN],
+        capture_output=True, text=True,
+    )
 
 
 class FokusKeeperStatusApp(rumps.App):

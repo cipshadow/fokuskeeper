@@ -8,9 +8,11 @@ echo "FokusKeeper - Uninstall"
 echo "======================="
 echo ""
 
-# Stop daemon and menubar (fine if they aren't running)
-pkill -f 'python.*fokuskeeper.py' 2>/dev/null || true
-pkill -f 'python.*fokuskeeper_menubar.py' 2>/dev/null || true
+# Stop daemon and menubar (fine if they aren't running). -u "$(id -u)": on a
+# shared Mac, an unscoped pkill would attempt (and harmlessly fail) to signal
+# another account's FokusKeeper too.
+pkill -f -u "$(id -u)" 'python.*fokuskeeper.py' 2>/dev/null || true
+pkill -f -u "$(id -u)" 'python.*fokuskeeper_menubar.py' 2>/dev/null || true
 echo "Stopped daemon and menu bar (if they were running)."
 
 remove_path() {

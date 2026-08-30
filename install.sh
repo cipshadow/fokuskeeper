@@ -129,7 +129,7 @@ if [ "$1" = "--with-control-panel" ]; then
 # FokusKeeper control panel — thin wrapper around the fokuskeeper CLI.
 FK=$Q_DIR/fokuskeeper
 
-if pgrep -f 'python.*fokuskeeper.py' > /dev/null; then
+if pgrep -f -u \$(id -u) 'python.*fokuskeeper.py' > /dev/null; then
     STATUS="ACTIVE"
     ACTION="Stop"
 else
