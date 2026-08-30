@@ -1094,6 +1094,40 @@ class TestCmdRunDoubleStartGuard:
         assert mock_monitor.called is True
         assert mock_setup.called is False
 
+    def test_pgrep_call_is_scoped_to_current_user(self):
+        # On a shared Mac (Fast User Switching or multiple real accounts),
+        # an unscoped `pgrep -f` matches ANY user's FokusKeeper process --
+        # this daemon would then refuse to start because a *different*
+        # account's instance looks like "already running". -u must be
+        # present so pgrep only ever sees this user's own processes.
+        with patch.object(sg, '_run', return_value=subprocess.CompletedProcess(
+                [], returncode=1, stdout="", stderr="")) as mock_run, \
+             patch.object(sg, 'monitor'), \
+             patch.object(sg, 'CONFIG_FILE', self.config_file), \
+             patch.object(sg, 'log'):
+            self.config_file.write_text(json.dumps({"enabled": ["slack"]}))
+            sg.cmd_run()
+
+        call_args = mock_run.call_args[0][0]
+        assert "-u" in call_args
+        assert str(os.getuid()) in call_args
+
+
+class TestCmdStatusUserScoping:
+    """cmd_status(): same cross-account pgrep scoping as cmd_run()."""
+
+    def test_pgrep_call_is_scoped_to_current_user(self, capsys):
+        with patch.object(sg, '_run', return_value=subprocess.CompletedProcess(
+                [], returncode=1, stdout="", stderr="")) as mock_run, \
+             patch.object(sg, 'CONFIG_FILE', Path("/nonexistent/config.json")), \
+             patch.object(sg, 'STATE_FILE', Path("/nonexistent/state.json")):
+            sg.cmd_status()
+
+        call_args = mock_run.call_args[0][0]
+        assert "-u" in call_args
+        assert str(os.getuid()) in call_args
+        assert "not running" in capsys.readouterr().out
+
 
 class TestRunTimeout:
     """_run(): a TimeoutExpired becomes the returncode-1 failure sentinel."""

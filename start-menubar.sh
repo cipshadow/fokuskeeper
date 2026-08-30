@@ -15,7 +15,7 @@ else
   PY="/usr/bin/python3"
 fi
 
-if pgrep -f 'python.*fokuskeeper_menubar.py' >/dev/null 2>&1; then
+if pgrep -f -u "$(id -u)" 'python.*fokuskeeper_menubar.py' >/dev/null 2>&1; then
   echo "FokusKeeper menu bar icon is already running."
   exit 0
 fi
@@ -25,7 +25,7 @@ nohup "$PY" "$DIR/fokuskeeper_menubar.py" >>"$LOG_FILE" 2>&1 &
 disown
 
 sleep 1
-if pgrep -f 'python.*fokuskeeper_menubar.py' >/dev/null 2>&1; then
+if pgrep -f -u "$(id -u)" 'python.*fokuskeeper_menubar.py' >/dev/null 2>&1; then
   echo "Running. Look for the shield icon in your menu bar."
   echo "Log: $LOG_FILE"
 else

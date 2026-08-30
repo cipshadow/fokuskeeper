@@ -16,7 +16,10 @@ else
 fi
 
 is_running() {
-    pgrep -f "$PATTERN" > /dev/null
+    # -u "$(id -u)": on a shared Mac (Fast User Switching or multiple real
+    # accounts), pgrep -f alone matches ANY user's FokusKeeper -- another
+    # account's daemon would make this one falsely report "already running".
+    pgrep -f -u "$(id -u)" "$PATTERN" > /dev/null
 }
 
 usage() {
@@ -60,11 +63,11 @@ case "$1" in
         fi
         ;;
     stop)
-        pkill -f "$PATTERN"
+        pkill -f -u "$(id -u)" "$PATTERN"
         echo "FokusKeeper stopped."
         ;;
     restart)
-        pkill -f "$PATTERN"
+        pkill -f -u "$(id -u)" "$PATTERN"
         sleep 1
         exec "$DIR/fokuskeeper" start
         ;;

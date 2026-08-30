@@ -1074,7 +1074,7 @@ def cmd_stats():
 
 def cmd_status():
     """Print whether the daemon is running, plus today's stats."""
-    result = _run(["pgrep", "-f", DAEMON_PROCESS_PATTERN])
+    result = _run(["pgrep", "-f", "-u", str(os.getuid()), DAEMON_PROCESS_PATTERN])
     pids = {p.strip() for p in result.stdout.split() if p.strip()}
     pids.discard(str(os.getpid()))  # this status invocation matches the pattern too
     if pids:
@@ -1232,7 +1232,7 @@ def cmd_run():
     chooser here is a safe fallback, not a degraded one.
     """
     # Double-start guard: refuse to run a second daemon.
-    result = _run(["pgrep", "-f", DAEMON_PROCESS_PATTERN])
+    result = _run(["pgrep", "-f", "-u", str(os.getuid()), DAEMON_PROCESS_PATTERN])
     pids = {p.strip() for p in result.stdout.split() if p.strip()}
     pids.discard(str(os.getpid()))  # this invocation matches the pattern too
     pids.discard(str(os.getppid()))  # so can a wrapper script's interpreter
