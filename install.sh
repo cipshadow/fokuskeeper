@@ -21,6 +21,14 @@ INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Installation directory: $INSTALL_DIR"
 echo ""
 
+# Prefer the repo's own venv (if the user set one up for the menubar app)
+# so this install run is consistent with what the daemon itself will use.
+if [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+    PY="$INSTALL_DIR/.venv/bin/python3"
+else
+    PY="python3"
+fi
+
 # Shell-escaped form of INSTALL_DIR for safe interpolation into generated
 # launcher scripts below. %q produces output that is already quoted for
 # reuse as shell input, so it must be used UNQUOTED wherever it appears.
@@ -47,7 +55,7 @@ if [ -x $Q_DIR/.venv/bin/python3 ]; then
 else
     PY="python3"
 fi
-exec "\$PY" fokuskeeper.py run >> "\$HOME/Library/Logs/fokuskeeper-stdout.log" 2>&1
+exec "\$PY" -u fokuskeeper.py run >> "\$HOME/Library/Logs/fokuskeeper-stdout.log" 2>&1
 EOF
 chmod +x "$APP_PATH/Contents/MacOS/run"
 
@@ -106,9 +114,24 @@ else
 fi
 echo ""
 
-# Step 4: Start the daemon ("fokuskeeper start" verifies and exits 1 on
+# Step 4: First-run target chooser (foreground, interactive). The resident
+# daemon (step 5) never shows UI — see cmd_run()'s docstring in
+# fokuskeeper.py — so first-run selection happens here instead, while
+# install.sh still has your terminal's attention. Skipped if a config
+# already exists (e.g. re-running install.sh, or a migrated legacy setup).
+CONFIG_FILE="$HOME/.fokuskeeper-config.json"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "[4/5] Choose which distractions to gate..."
+    "$PY" "$INSTALL_DIR/fokuskeeper.py" setup
+    echo ""
+else
+    echo "[4/5] Existing target selection found, skipping chooser."
+    echo ""
+fi
+
+# Step 5: Start the daemon ("fokuskeeper start" verifies and exits 1 on
 # failure, which aborts this script via set -e)
-echo "[4/4] Starting the daemon..."
+echo "[5/5] Starting the daemon..."
 "$INSTALL_DIR/fokuskeeper" start
 echo "      Daemon is running."
 
