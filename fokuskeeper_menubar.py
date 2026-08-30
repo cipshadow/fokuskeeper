@@ -34,14 +34,71 @@ PROCESS_PATTERN = "python.*fokuskeeper.py"
 LOCK_FILE = Path.home() / ".fokuskeeper-menubar.lock"
 POLL_SECONDS = 5
 
-ICON_SYMBOLS_ON = ("shield.lefthalf.filled", "lock.shield")
-ICON_SYMBOLS_OFF = ("shield.slash", "shield")
+ICON_BASE_SYMBOLS = ("shield.fill", "shield.lefthalf.filled", "shield")
 ICON_POINT_SIZE = 18
+ICON_OFF_FRACTION = 0.4  # dims the shield when stopped; the K cutout stays crisp
 
 FALLBACK_TITLE_ON = "🛡️"
 FALLBACK_TITLE_OFF = "🛡️⏸"
 
 _lock_handle = None
+_shield_k_cache = {}
+
+
+def _shield_k_image(on):
+    """A shield with a 'K' cut out of it, cached per on/off state.
+
+    No SF Symbol combines a shield with an arbitrary letter, so this
+    composites one: draw the shield glyph solid, then punch the K through it
+    with a destination-out blend — the same cutout technique Apple's own
+    compound shield symbols use (e.g. shield.lefthalf.filled's two-tone
+    split). Returns None if no shield symbol resolves at all, so the caller
+    can fall back to the plain-text title.
+    """
+    if on in _shield_k_cache:
+        return _shield_k_cache[on]
+
+    base = None
+    for name in ICON_BASE_SYMBOLS:
+        base = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            name, "FokusKeeper"
+        )
+        if base is not None:
+            break
+    if base is None:
+        _shield_k_cache[on] = None
+        return None
+
+    size = ICON_POINT_SIZE
+    image = AppKit.NSImage.alloc().initWithSize_((size, size))
+    image.lockFocus()
+
+    rect = AppKit.NSMakeRect(0, 0, size, size)
+    base.drawInRect_fromRect_operation_fraction_(
+        rect, AppKit.NSZeroRect, AppKit.NSCompositingOperationSourceOver,
+        1.0 if on else ICON_OFF_FRACTION,
+    )
+
+    font = AppKit.NSFont.boldSystemFontOfSize_(size * 0.62)
+    attrs = {
+        AppKit.NSFontAttributeName: font,
+        AppKit.NSForegroundColorAttributeName: AppKit.NSColor.blackColor(),
+    }
+    text = AppKit.NSAttributedString.alloc().initWithString_attributes_("K", attrs)
+    text_size = text.size()
+    x = (size - text_size.width) / 2.0 - 2  # nudge left: the K's diagonal strokes read visually off-center otherwise
+    y = (size - text_size.height) / 2.0 + size * 0.02  # nudge up: the shield's pointed tip reads as dead weight below center
+
+    ctx = AppKit.NSGraphicsContext.currentContext()
+    ctx.saveGraphicsState()
+    ctx.setCompositingOperation_(AppKit.NSCompositingOperationDestinationOut)
+    text.drawAtPoint_((x, y))
+    ctx.restoreGraphicsState()
+
+    image.unlockFocus()
+    image.setTemplate_(True)
+    _shield_k_cache[on] = image
+    return image
 
 
 def is_running():
@@ -122,15 +179,8 @@ class FokusKeeperStatusApp(rumps.App):
         if item is None:
             return
 
-        names = ICON_SYMBOLS_ON if self.on else ICON_SYMBOLS_OFF
-        image = None
         try:
-            for name in names:
-                image = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                    name, "FokusKeeper"
-                )
-                if image is not None:
-                    break
+            image = _shield_k_image(self.on)
         except AttributeError:
             image = None
 
@@ -139,8 +189,6 @@ class FokusKeeperStatusApp(rumps.App):
             item.setTitle_(FALLBACK_TITLE_ON if self.on else FALLBACK_TITLE_OFF)
             return
 
-        image.setTemplate_(True)
-        image.setSize_((ICON_POINT_SIZE, ICON_POINT_SIZE))
         item.setTitle_("")
         item.setImage_(image)
 
