@@ -158,6 +158,16 @@ def match_url(url, targets=None):
     return None
 
 
+def _hostname_for_log(url):
+    """Hostname only, for log lines — never the full URL (path/query can carry
+    search terms or message content). Restoring the tab still uses the real
+    original_url; this is a logging-only redaction.
+    """
+    try:
+        return urlparse(url).hostname or url
+    except ValueError:
+        return url
+
 
 # ============================================================================
 # Security Functions
@@ -626,7 +636,7 @@ def restore_tab(window_id, tab_id, original_url, label):
     """Restore the parked tab to the exact URL it was on (same window/profile)."""
     safe_url = sanitize_for_applescript(original_url)
     if _tell_tab(window_id, tab_id, f'set URL of targetTab to "{safe_url}"'):
-        log(f"Restored {label} tab in original window/profile: {original_url}")
+        log(f"Restored {label} tab in original window/profile: {_hostname_for_log(original_url)}")
         return True
     log(f"Could not restore the original {label} tab - not opening {label} elsewhere")
     return False
@@ -673,7 +683,7 @@ class AppSurface:
         self.target = target
 
     def block(self):
-        quit_app(self.target.app_name)
+        return quit_app(self.target.app_name)
 
     def restore(self):
         _run(["open", "-a", self.target.app_name])
@@ -696,7 +706,7 @@ class WebSurface:
         self.url = url
 
     def block(self):
-        park_tab(self.window_id, self.tab_id, self.target.label)
+        return park_tab(self.window_id, self.tab_id, self.target.label)
 
     def restore(self):
         restore_tab(self.window_id, self.tab_id, self.url, self.target.label)
@@ -730,7 +740,7 @@ def handle_intercept(target, surface):
         return True
 
     # Gate.PROMPT — intercept!
-    surface.block()
+    blocked = surface.block()
     time.sleep(0.3)
 
     allowed = show_confirmation_dialog(target)
@@ -745,8 +755,18 @@ def handle_intercept(target, surface):
 
     surface.discard()
     prevented_count = increment_prevented_count(key)
-    log(f"{target.label} access denied - distraction prevented (#{prevented_count} today)")
-    print(f"Access denied - good job staying focused! ({prevented_count} distractions prevented)")
+    if blocked:
+        log(f"{target.label} access denied - distraction prevented (#{prevented_count} today)")
+        print(f"Access denied - good job staying focused! ({prevented_count} distractions prevented)")
+    else:
+        # The block itself failed (e.g. a missing Automation grant — see the
+        # WARNING logged by quit_app/park_tab above), so the target may
+        # still be sitting open. Still honors the user's "no" for counting
+        # purposes, but says so plainly instead of implying it worked.
+        log(f"{target.label} access denied, but it may not be fully blocked "
+            f"- see the WARNING above (#{prevented_count} today)")
+        print(f"Access denied, but FokusKeeper couldn't confirm {target.label} "
+              f"is closed - check logs. ({prevented_count} distractions prevented)")
     return False
 
 
@@ -957,7 +977,7 @@ def monitor():
                     web_target = match_url(chrome_url, targets)
 
                     if web_target is not None and web_target.key != last_web_key:
-                        log(f"{web_target.label} tab activated: {chrome_url}")
+                        log(f"{web_target.label} tab activated: {_hostname_for_log(chrome_url)}")
                         # Pin the exact tab so it can be restored into its own
                         # profile. Ids come ONLY from get_chrome_front_tab_ref.
                         window_id, tab_id = get_chrome_front_tab_ref()
