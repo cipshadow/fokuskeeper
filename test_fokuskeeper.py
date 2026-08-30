@@ -819,11 +819,13 @@ class TestRunSetup(_TempConfigMixin):
 class _RecordingSurface:
     """Stub surface that records block/restore/discard calls in order."""
 
-    def __init__(self):
+    def __init__(self, block_succeeds=True):
         self.calls = []
+        self.block_succeeds = block_succeeds
 
     def block(self):
         self.calls.append("block")
+        return self.block_succeeds
 
     def restore(self):
         self.calls.append("restore")
@@ -935,6 +937,17 @@ class TestHandleIntercept(_TempStateMixin):
         assert state["slack_opens"] == 2                  # not counted
         assert state["slack_prevented"] == 1
         assert "slack_granted_at" not in state            # no cooldown granted
+
+    def test_deny_with_failed_block_still_counts_but_says_so(self, capsys):
+        # surface.block() failing (e.g. a missing Automation grant) must not
+        # be silently reported as a clean win -- the target may still be open.
+        self.surface = _RecordingSurface(block_succeeds=False)
+        allowed, _ = self._intercept(self._prompt_seed(), dialog=False)
+
+        assert allowed is False
+        assert self.surface.calls == ["block", "discard"]
+        assert self._state()["slack_prevented"] == 1  # still counts the "no"
+        assert "couldn't confirm" in capsys.readouterr().out
 
 
 class TestRefreshLastSeen(_TempStateMixin):
