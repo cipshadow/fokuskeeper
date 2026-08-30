@@ -1098,6 +1098,77 @@ class TestRunTimeout:
         assert mock_log.called  # the timeout is logged, not swallowed
 
 
+class TestAccessWarnings:
+    """Automation-permission failures must be visible, not silent — the
+    original whole-feature-dead-with-no-trace bug class, first found on
+    Chrome tab reading and generalized here to every osascript call site
+    that can hit the same TCC wall on a fresh account.
+    """
+
+    def setup_method(self):
+        sg._access_warned.clear()
+
+    def _denied(self, stderr="Not authorized to send Apple events."):
+        return subprocess.CompletedProcess([], returncode=1, stdout="", stderr=stderr)
+
+    def test_frontmost_app_denied_warns_once_and_returns_none(self):
+        with patch.object(sg, '_run', return_value=self._denied()), \
+             patch.object(sg, 'log') as mock_log:
+            assert sg.get_frontmost_app() is None
+            assert sg.get_frontmost_app() is None  # second failure: no repeat warning
+
+        warnings = [c for c in mock_log.call_args_list if "WARNING" in c.args[0]]
+        assert len(warnings) == 1
+        assert "frontmost" in warnings[0].args[0].lower()
+
+    def test_frontmost_app_success_is_silent(self):
+        ok = subprocess.CompletedProcess([], returncode=0, stdout="Slack\n", stderr="")
+        with patch.object(sg, '_run', return_value=ok), patch.object(sg, 'log') as mock_log:
+            assert sg.get_frontmost_app() == "Slack"
+        assert mock_log.called is False
+
+    def test_chrome_tabs_denied_warns_once(self):
+        with patch.object(sg, '_run', return_value=self._denied()), \
+             patch.object(sg, 'log') as mock_log:
+            assert sg.get_chrome_active_tab_url() == ""
+            assert sg.get_chrome_active_tab_url() == ""
+
+        warnings = [c for c in mock_log.call_args_list if "WARNING" in c.args[0]]
+        assert len(warnings) == 1
+        assert "chrome" in warnings[0].args[0].lower()
+
+    def test_quit_app_denied_does_not_claim_success(self):
+        with patch.object(sg, '_run', return_value=self._denied()), \
+             patch.object(sg, 'log') as mock_log:
+            result = sg.quit_app("Slack")
+
+        assert result is False
+        logged = [c.args[0] for c in mock_log.call_args_list]
+        assert not any(msg == "Quit Slack" for msg in logged)
+        assert any("WARNING" in msg and "Slack" in msg for msg in logged)
+
+    def test_quit_app_success_logs_plainly(self):
+        ok = subprocess.CompletedProcess([], returncode=0, stdout="", stderr="")
+        with patch.object(sg, '_run', return_value=ok), patch.object(sg, 'log') as mock_log:
+            result = sg.quit_app("Slack")
+
+        assert result is True
+        mock_log.assert_called_once_with("Quit Slack")
+
+    def test_independent_grants_warn_independently(self):
+        # Denying System Events must not suppress a later, distinct warning
+        # about a specific app's Automation grant (or vice versa) -- these
+        # are separate permissions in System Settings.
+        with patch.object(sg, '_run', return_value=self._denied()), \
+             patch.object(sg, 'log') as mock_log:
+            sg.get_frontmost_app()
+            sg.quit_app("Slack")
+            sg.quit_app("WhatsApp")
+
+        warnings = [c.args[0] for c in mock_log.call_args_list if "WARNING" in c.args[0]]
+        assert len(warnings) == 3  # frontmost, quit:Slack, quit:WhatsApp each fire once
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
