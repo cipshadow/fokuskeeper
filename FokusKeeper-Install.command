@@ -21,7 +21,7 @@ if ! command -v git > /dev/null 2>&1; then
     echo "git isn't available yet. If macOS just offered to install the"
     echo "Command Line Tools, accept that, wait for it to finish, then"
     echo "double-click this file again."
-    read -p "Press Enter to close this window..." _
+    read -p "Press Enter to finish (you can close this window afterward)." _
     exit 1
 fi
 
@@ -32,20 +32,20 @@ if [ -d "$INSTALL_DIR/.git" ]; then
         echo "Could not update automatically (local changes in the way?)."
         echo "You can also just delete $INSTALL_DIR and double-click this"
         echo "file again for a completely fresh copy."
-        read -p "Press Enter to close this window..." _
+        read -p "Press Enter to finish (you can close this window afterward)." _
         exit 1
     fi
 elif [ -e "$INSTALL_DIR" ]; then
     echo "$INSTALL_DIR already exists and isn't a FokusKeeper download."
     echo "Move or rename it, then double-click this file again."
-    read -p "Press Enter to close this window..." _
+    read -p "Press Enter to finish (you can close this window afterward)." _
     exit 1
 else
     echo "Downloading FokusKeeper to $INSTALL_DIR ..."
     if ! git clone "$REPO_URL" "$INSTALL_DIR"; then
         echo ""
         echo "Download failed -- check your internet connection and try again."
-        read -p "Press Enter to close this window..." _
+        read -p "Press Enter to finish (you can close this window afterward)." _
         exit 1
     fi
 fi
@@ -60,4 +60,4 @@ if [ "$INSTALL_EXIT" -ne 0 ]; then
     echo "Setup hit a problem (see above). You can re-run it any time by"
     echo "double-clicking this file again."
 fi
-read -p "Press Enter to close this window..." _
+read -p "Press Enter to finish (you can close this window afterward)." _
