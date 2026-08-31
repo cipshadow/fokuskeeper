@@ -152,14 +152,15 @@ else
 fi
 echo ""
 
-# Step 5: First-run target chooser (foreground, interactive). The resident
-# daemon never shows UI — see cmd_run()'s docstring in fokuskeeper.py — so
-# first-run selection happens here instead, while install.sh still has your
-# terminal's attention. Skipped if a config already exists (e.g. re-running
-# install.sh, or a migrated legacy setup).
+# Step 5: First-run settings (foreground, interactive): which apps to gate,
+# then cooldown and quiet-period minutes. The resident daemon never shows UI
+# — see cmd_run()'s docstring in fokuskeeper.py — so this happens here
+# instead, while install.sh still has your terminal's attention. Skipped if
+# a config already exists (e.g. re-running install.sh, or a migrated legacy
+# setup).
 CONFIG_FILE="$HOME/.fokuskeeper-config.json"
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "[5/6] Choose which distractions to gate..."
+    echo "[5/6] Choose your settings..."
     # `|| true`: however the user dismisses this (the button, Escape, the
     # window's close control), the install must continue either way -- this
     # is just a welcome message, never a reason to abort setup.
@@ -167,13 +168,13 @@ if [ ! -f "$CONFIG_FILE" ]; then
 display dialog "Welcome to FokusKeeper!" & return & return & ¬
     "It watches for distracting apps and sites (Slack, WhatsApp, Instagram, and more). When you open one, it pauses and asks if you're sure." & return & return & ¬
     "\"Stay focused\" closes it and counts as a win. \"I have a reason\" opens it and gives you a few minutes before it asks again." & return & return & ¬
-    "Next, choose which apps and sites to watch." ¬
+    "Next, choose which apps and sites to watch, plus your cooldown and quiet-period minutes." ¬
     buttons {"Got it"} default button "Got it" with title "FokusKeeper" with icon note
 APPLESCRIPT
-    "$PY" "$INSTALL_DIR/fokuskeeper.py" setup
+    "$PY" "$INSTALL_DIR/fokuskeeper.py" settings
     echo ""
 else
-    echo "[5/6] Existing target selection found, skipping chooser."
+    echo "[5/6] Existing settings found, skipping."
     echo ""
 fi
 

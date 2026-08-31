@@ -1034,8 +1034,8 @@ def monitor():
     print("  extended by continued use.")
     print()
     print(f"🤫 QUIET PERIOD: {quiet_period_minutes()} minutes")
-    print(f"  If a target hasn't been used in {quiet_period_minutes()}+ minutes, the next")
-    print("  open is let through without a prompt (checked per target).")
+    print(f"  If an app hasn't been used in {quiet_period_minutes()}+ minutes, the next")
+    print("  open is let through without a prompt (checked per app).")
     print()
     print("💾 TIME RESCUED CALCULATION:")
     print("  Each blocked distraction saves ~10 minutes of focus time")
@@ -1310,8 +1310,8 @@ def run_setup():
     script = (
         f"choose from list {{{items}}} "
         f'with title "FokusKeeper" '
-        f'with prompt "Which distractions should FokusKeeper gate? '
-        f"Currently gated targets are selected. "
+        f'with prompt "Which apps and sites should FokusKeeper gate? '
+        f"Currently gated apps are selected. "
         f'(Cmd-click to toggle)" '
         f"default items {{{default_items}}} "
         f"with multiple selections allowed"
@@ -1337,15 +1337,8 @@ def run_setup():
     config = _read_raw_config()
     config["enabled"] = enabled
     save_config(config)
-    log(f"Setup saved: enabled targets = {', '.join(enabled) or 'none'}")
+    log(f"Setup saved: enabled apps = {', '.join(enabled) or 'none'}")
     return enabled
-
-
-def cmd_setup():
-    """`fokuskeeper setup`: run the chooser, then print the enabled set."""
-    run_setup()
-    labels = ", ".join(t.label for t in enabled_targets())
-    print(f"Enabled targets: {labels}")
 
 
 def _prompt_for_minutes(prompt_text, current_value):
@@ -1376,8 +1369,11 @@ def run_timing_settings():
     the other field, if only one step was reached) is left untouched.
     """
     new_cooldown = _prompt_for_minutes(
-        'Cooldown: after clicking "I have a reason," how many minutes '
-        "of uninterrupted access before FokusKeeper asks again?",
+        "Cooldown (minutes): how long after you say you have a reason does "
+        'FokusKeeper treat a detour as the same session? Example: with 5, '
+        "if you're in Slack, search something on Google for a few minutes, "
+        "then go back to Slack, it won't ask again -- that's still one "
+        "working session.",
         cooldown_minutes(),
     )
     if new_cooldown is None:
@@ -1385,8 +1381,10 @@ def run_timing_settings():
         return None
 
     new_quiet = _prompt_for_minutes(
-        "Quiet period: after this many minutes of NOT using a target, the "
-        "next time you open it is let through automatically, without asking.",
+        "Quiet period (minutes): how long between check-ins counts as "
+        "normal, unprompted use? Example: with 60, checking Slack once an "
+        "hour is fine and won't ask -- more often than that, and you'll "
+        "get prompted.",
         quiet_period_minutes(),
     )
     if new_quiet is None:
@@ -1401,14 +1399,17 @@ def run_timing_settings():
     return (new_cooldown, new_quiet)
 
 
-def cmd_timing():
-    """`fokuskeeper timing`: run the two prompts, then print the result."""
-    result = run_timing_settings()
-    if result is None:
-        print("Timing settings unchanged.")
-    else:
-        new_cooldown, new_quiet = result
-        print(f"Cooldown: {new_cooldown} minutes. Quiet period: {new_quiet} minutes.")
+def cmd_settings():
+    """`fokuskeeper settings`: one combined flow -- choose apps, then set the
+    cooldown and quiet-period minutes. Each step keeps its own cancel
+    semantics (see run_setup and run_timing_settings); this just presents
+    them back-to-back as a single settings visit instead of two commands.
+    """
+    run_setup()
+    run_timing_settings()
+    labels = ", ".join(t.label for t in enabled_targets())
+    print(f"Enabled apps: {labels}")
+    print(f"Cooldown: {cooldown_minutes()} minutes. Quiet period: {quiet_period_minutes()} minutes.")
 
 
 def cmd_run():
@@ -1455,12 +1456,12 @@ def main(argv=None):
         nargs="?",
         default="run",
         choices=["run", "stats", "status", "history", "report", "reset",
-                 "setup", "timing"],
+                 "settings"],
         help="run: start the monitor daemon (default); stats: today's numbers; "
              "status: daemon liveness + stats; history: last 7 days; "
              "report: all-time totals; reset: zero today's counters; "
-             "setup: choose which targets to gate; "
-             "timing: adjust the cooldown and quiet-period minutes",
+             "settings: choose which apps to gate and adjust cooldown/"
+             "quiet-period minutes",
     )
     args = parser.parse_args(argv)
 
@@ -1475,8 +1476,7 @@ def main(argv=None):
         "history": cmd_history,
         "report": cmd_report,
         "reset": cmd_reset,
-        "setup": cmd_setup,
-        "timing": cmd_timing,
+        "settings": cmd_settings,
     }
     dispatch[args.command]()
 

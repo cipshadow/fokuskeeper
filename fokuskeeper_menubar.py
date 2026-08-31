@@ -152,21 +152,14 @@ def start_daemon():
 
 
 def open_settings(_sender=None):
-    """Re-run the target chooser (the same one install.sh and `fokuskeeper
-    setup` use — no separate settings UI to keep in sync). Runs in the
-    foreground and blocks the menu bar app's own event loop while the
-    chooser dialog is up; that's fine, since a modal system dialog already
-    blocks everything else the user could do in the meantime.
+    """Re-run the combined settings flow (same as `fokuskeeper settings`):
+    app chooser, then cooldown, then quiet-period -- no separate settings UI
+    to keep in sync. Runs in the foreground and blocks the menu bar app's
+    own event loop while the dialogs are up; that's fine, since a modal
+    system dialog already blocks everything else the user could do in the
+    meantime.
     """
-    subprocess.run([_resident_python(), str(DAEMON_SCRIPT), "setup"])
-
-
-def open_timing(_sender=None):
-    """Re-run the cooldown/quiet-period prompts (same as `fokuskeeper
-    timing`) — see open_settings() for why this shells out rather than
-    reimplementing the dialogs here.
-    """
-    subprocess.run([_resident_python(), str(DAEMON_SCRIPT), "timing"])
+    subprocess.run([_resident_python(), str(DAEMON_SCRIPT), "settings"])
 
 
 def stop_daemon():
@@ -209,9 +202,8 @@ class FokusKeeperStatusApp(rumps.App):
         self.on = False
 
         self.toggle_item = rumps.MenuItem("Start FokusKeeper", callback=self.toggle)
-        self.settings_item = rumps.MenuItem("Choose targets...", callback=open_settings)
-        self.timing_item = rumps.MenuItem("Adjust timing...", callback=open_timing)
-        self.menu = [self.toggle_item, None, self.settings_item, self.timing_item]
+        self.settings_item = rumps.MenuItem("Settings...", callback=open_settings)
+        self.menu = [self.toggle_item, None, self.settings_item]
 
         # The menu bar icon is now the default entry point (install.sh's
         # login launcher runs this, not the daemon directly), so launching
