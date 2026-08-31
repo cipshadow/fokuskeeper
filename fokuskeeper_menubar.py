@@ -124,6 +124,13 @@ def agent_installed():
     return result.returncode == 0
 
 
+def _resident_python():
+    """The python that should run fokuskeeper.py -- the repo's own venv if
+    the menu bar setup created one, else the system python3."""
+    venv_python = HERE / ".venv" / "bin" / "python3"
+    return str(venv_python) if venv_python.exists() else "/usr/bin/python3"
+
+
 def start_daemon():
     """Start via launchd when available, else spawn directly."""
     if agent_installed():
@@ -135,14 +142,22 @@ def start_daemon():
 
     # No agent on this machine (or kickstart refused) — run it ourselves.
     # start_new_session detaches it so it outlives this menu bar app.
-    venv_python = HERE / ".venv" / "bin" / "python3"
-    python = str(venv_python) if venv_python.exists() else "/usr/bin/python3"
     subprocess.Popen(
-        [python, "-u", str(DAEMON_SCRIPT), "run"],
+        [_resident_python(), "-u", str(DAEMON_SCRIPT), "run"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+def open_settings(_sender=None):
+    """Re-run the target chooser (the same one install.sh and `fokuskeeper
+    setup` use — no separate settings UI to keep in sync). Runs in the
+    foreground and blocks the menu bar app's own event loop while the
+    chooser dialog is up; that's fine, since a modal system dialog already
+    blocks everything else the user could do in the meantime.
+    """
+    subprocess.run([_resident_python(), str(DAEMON_SCRIPT), "setup"])
 
 
 def stop_daemon():
@@ -162,7 +177,8 @@ class FokusKeeperStatusApp(rumps.App):
         self.on = False
 
         self.toggle_item = rumps.MenuItem("Start FokusKeeper", callback=self.toggle)
-        self.menu = [self.toggle_item]
+        self.settings_item = rumps.MenuItem("Choose targets...", callback=open_settings)
+        self.menu = [self.toggle_item, None, self.settings_item]
 
         # The menu bar icon is now the default entry point (install.sh's
         # login launcher runs this, not the daemon directly), so launching

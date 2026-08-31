@@ -74,7 +74,7 @@ The installer checks for `python3`, sets up a menu bar icon (a small `.venv` wit
 
 If the menu bar setup can't complete (no network, or no build tools for one of its dependencies), install continues anyway with a plain headless daemon — no menu bar icon, but gating still works fully. Retry the menu bar setup any time with `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && ./start-menubar.sh`, then re-run `./install.sh` to regenerate the login launcher so it picks it up automatically.
 
-On first run a native chooser lists all ten targets, pre-selected; deselect any you want ungated. Your choice is saved to `~/.fokuskeeper-config.json`.
+On first run a short welcome screen explains how the dialog and cooldown work, then a native chooser lists all ten targets, pre-selected; deselect any you want ungated. Your choice is saved to `~/.fokuskeeper-config.json`. Change it again any time from the menu bar icon's **Choose targets...** menu item.
 
 ### Permissions
 
@@ -110,7 +110,7 @@ FokusKeeper - Today's stats (2026-08-30)
 
 ## Customization
 
-- **Targets**: `./fokuskeeper setup` reopens the chooser. Changes apply live; the daemon watches the config file's mtime, no restart needed.
+- **Targets**: click **Choose targets...** in the menu bar icon's menu, or run `./fokuskeeper setup` from a terminal -- both reopen the same chooser. Changes apply live; the daemon watches the config file's mtime, no restart needed.
 - **Timing**: edit `COOLDOWN_MINUTES` (default 3) and `QUIET_PERIOD_MINUTES` (default 60) at the top of `fokuskeeper.py`, then restart the daemon. Deliberate v1 choice: these live in code, not a config file.
 - **Menu bar icon**: installed by default (see Install above). A shield-with-K icon shows daemon state; click it to start/stop. To start it manually without logging out and back in, run `./start-menubar.sh` — it prefers the repo's `.venv` automatically and starts the daemon itself if it isn't already running.
 
