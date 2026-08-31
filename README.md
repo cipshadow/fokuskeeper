@@ -6,7 +6,7 @@ A macOS distraction gate. Opening Slack, YouTube, or eight other time sinks cost
 
 ## What it does
 
-FokusKeeper watches your frontmost app. When you open a gated app or switch a Chrome tab to a gated site, it blocks the surface (quits the app, or parks the tab at `about:blank`) and shows a dialog with today's numbers: opens, blocks, time rescued, and a motivation line.
+FokusKeeper watches your frontmost app. When you open a gated app or switch a browser tab to a gated site, it blocks the surface (quits the app, or parks the tab at `about:blank`) and shows a dialog with today's numbers: opens, blocks, time rescued, and a motivation line.
 
 Two buttons:
 
@@ -27,7 +27,7 @@ Prefer git? See [Manual install](#install) below.
 
 ## Targets
 
-| Target | App | Web (Chrome) |
+| Target | App | Web (Chrome, Safari) |
 |---|---|---|
 | Slack | Slack | app.slack.com |
 | Gmail | - | mail.google.com |
@@ -40,11 +40,11 @@ Prefer git? See [Manual install](#install) below.
 | TikTok | - | tiktok.com |
 | LinkedIn | - | linkedin.com |
 
-You pick which of these to gate at first run; all ten are pre-selected.
+You pick which of these to gate at first run; all ten are pre-selected. Firefox isn't supported — it has no AppleScript support for reading tab URLs, so there's no reliable way to gate it (see the FAQ).
 
 ## How it works
 
-A Python daemon (`fokuskeeper.py`, stdlib only) polls the frontmost application every 0.5 seconds via `osascript`. When Chrome is frontmost it also reads the active tab's URL. Detection is edge-triggered: a target prompts when you switch to it, not continuously while you stay on it.
+A Python daemon (`fokuskeeper.py`, stdlib only) polls the frontmost application every 0.5 seconds via `osascript`. When Chrome or Safari is frontmost it also reads the active tab's URL. Detection is edge-triggered: a target prompts when you switch to it, not continuously while you stay on it.
 
 On each detected open, the gate decides in strict precedence order:
 
@@ -53,13 +53,13 @@ On each detected open, the gate decides in strict precedence order:
 3. **Quiet period**: no use of that target in 60+ minutes, auto-allow.
 4. **Prompt**: block the surface and show the dialog.
 
-Cooldowns are shared per target across surfaces: allowing the Slack app also covers app.slack.com in Chrome for the same 3 minutes. The cooldown clock is fixed at the moment of the grant; continued use does not extend it.
+Cooldowns are shared per target across surfaces: allowing the Slack app also covers app.slack.com in your browser for the same 3 minutes. The cooldown clock is fixed at the moment of the grant; continued use does not extend it.
 
 ## Prerequisites
 
 - macOS 12 or later
 - Python 3.9+ (stdlib only for the daemon itself; the system `python3` works). A fresh Mac without developer tools will offer to install the Xcode Command Line Tools the first time you run `python3`; accept that, or `brew install python`.
-- Google Chrome, if you want web gating (the app surfaces work without it)
+- Google Chrome and/or Safari, if you want web gating (the app surfaces work without either)
 - Internet access during install, to fetch `rumps` for the menu bar icon (see below — the daemon still works fine without it)
 
 ## Install
@@ -78,9 +78,9 @@ On first run a native chooser lists all ten targets, pre-selected; deselect any 
 
 ### Permissions
 
-macOS asks for **Automation** permission the first time FokusKeeper talks to System Events (frontmost-app polling) and to Google Chrome (tab reading). Click Allow on both.
+macOS asks for **Automation** permission the first time FokusKeeper talks to System Events (frontmost-app polling), Google Chrome, and Safari (tab reading) -- each browser is a separate grant, only asked for the ones you actually use. Click Allow.
 
-Grants are **per launching app**: the daemon started from your terminal and the daemon started by FokusKeeper.app each need their own grant. If web gating stops silently after you switch how the daemon starts, run `./fokuskeeper logs` and look for the `WARNING: cannot read Chrome tabs` line, then re-grant Automation for Google Chrome to the launching app in System Settings -> Privacy & Security -> Automation.
+Grants are **per launching app**: the daemon started from your terminal and the daemon started by FokusKeeper.app each need their own grant. If web gating stops silently after you switch how the daemon starts, run `./fokuskeeper logs` and look for a `WARNING: Cannot read ... tabs` line, then re-grant Automation for that browser to the launching app in System Settings -> Privacy & Security -> Automation.
 
 ## Usage
 
@@ -126,7 +126,10 @@ FokusKeeper - Today's stats (2026-08-30)
 ## FAQ
 
 **Which browsers are gated?**
-Google Chrome only. Safari, Arc, and Firefox are not supported yet. Native app gating (Slack, WhatsApp) works regardless of browser.
+Google Chrome and Safari. Arc is Chromium-based but untested; Firefox can't be supported the same way -- it has no AppleScript dictionary support for reading a tab's URL, so there's no reliable way to detect what site is open. Native app gating (Slack, WhatsApp) works regardless of browser.
+
+**Does restoring an allowed tab work the same way in both browsers?**
+Almost. Chrome exposes a stable numeric id per tab, so a restore always lands on the exact tab even if you've opened others in that window meanwhile. Safari's scripting support has no per-tab id -- only a window id -- so FokusKeeper restores to "whatever tab is current in that window" instead. In practice this only differs if you switch to a different tab in that same window during the second or so the dialog takes to appear.
 
 **Why only app.slack.com and not all of slack.com?**
 Matching all of slack.com would also gate sign-in and marketing pages, and the sign-in flow would get you prompted twice on the way into the app. The hostname match is deliberate.
@@ -141,7 +144,7 @@ Nowhere. State, history, and config live in your home directory (`~/.fokuskeeper
 Yes, trivially: stop the daemon, or click the allow button. FokusKeeper is a mindfulness speed bump for yourself, not parental controls. If you can bypass it without noticing you did, that is the moment it was built for.
 
 **What does 0.5-second polling cost?**
-One short `osascript` call per tick (two while Chrome is frontmost). CPU use is negligible on any modern Mac.
+One short `osascript` call per tick (two while a supported browser is frontmost). CPU use is negligible on any modern Mac.
 
 **What happens if I press Return while the dialog is focused?**
 "Stay focused" is the default button, so Return blocks. Reflex-smashing the keyboard lands on the safe side; allowing requires clicking the other button.
