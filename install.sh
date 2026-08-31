@@ -160,6 +160,16 @@ echo ""
 CONFIG_FILE="$HOME/.fokuskeeper-config.json"
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "[5/6] Choose which distractions to gate..."
+    # `|| true`: however the user dismisses this (the button, Escape, the
+    # window's close control), the install must continue either way -- this
+    # is just a welcome message, never a reason to abort setup.
+    osascript <<'APPLESCRIPT' || true
+display dialog "Welcome to FokusKeeper!" & return & return & ¬
+    "It watches for distracting apps and sites (Slack, WhatsApp, Instagram, and more). When you open one, it pauses and asks if you're sure." & return & return & ¬
+    "\"Stay focused\" closes it and counts as a win. \"I have a reason\" opens it and gives you a few minutes before it asks again." & return & return & ¬
+    "Next, choose which apps and sites to watch." ¬
+    buttons {"Got it"} default button "Got it" with title "FokusKeeper" with icon note
+APPLESCRIPT
     "$PY" "$INSTALL_DIR/fokuskeeper.py" setup
     echo ""
 else
