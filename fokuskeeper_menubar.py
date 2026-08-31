@@ -32,6 +32,7 @@ DAEMON_SCRIPT = HERE / "fokuskeeper.py"
 AGENT_LABEL = "com.fokuskeeper.daemon"
 PROCESS_PATTERN = "python.*fokuskeeper.py"
 LOCK_FILE = Path.home() / ".fokuskeeper-menubar.lock"
+DESIRED_STATE_FILE = Path.home() / ".fokuskeeper-desired-state"
 POLL_SECONDS = 5
 
 ICON_BASE_SYMBOLS = ("shield.fill", "shield.lefthalf.filled", "shield")
@@ -160,6 +161,14 @@ def open_settings(_sender=None):
     subprocess.run([_resident_python(), str(DAEMON_SCRIPT), "setup"])
 
 
+def open_timing(_sender=None):
+    """Re-run the cooldown/quiet-period prompts (same as `fokuskeeper
+    timing`) — see open_settings() for why this shells out rather than
+    reimplementing the dialogs here.
+    """
+    subprocess.run([_resident_python(), str(DAEMON_SCRIPT), "timing"])
+
+
 def stop_daemon():
     """pkill regardless of how it was started (launchd vs. direct spawn); no
     KeepAlive means it stays down. Scoped to this user, not other accounts'
@@ -171,6 +180,29 @@ def stop_daemon():
     )
 
 
+def desired_running():
+    """Whether the daemon should be on, per the user's last explicit choice.
+
+    Defaults to True when the file is absent (first-ever launch, per
+    FokusKeeperStatusApp.__init__'s docstring) or unreadable -- everything
+    else preserves a deliberate `stop` across menu bar app relaunches,
+    instead of __init__ silently overriding it every time the app restarts
+    (a real bug: a menu bar app relaunch used to force the daemon back on
+    even right after the user stopped it).
+    """
+    try:
+        return DESIRED_STATE_FILE.read_text().strip() != "off"
+    except OSError:
+        return True
+
+
+def set_desired_running(value):
+    try:
+        DESIRED_STATE_FILE.write_text("on" if value else "off")
+    except OSError:
+        pass
+
+
 class FokusKeeperStatusApp(rumps.App):
     def __init__(self):
         super().__init__("FokusKeeper", title=FALLBACK_TITLE_OFF, quit_button="Quit")
@@ -178,13 +210,17 @@ class FokusKeeperStatusApp(rumps.App):
 
         self.toggle_item = rumps.MenuItem("Start FokusKeeper", callback=self.toggle)
         self.settings_item = rumps.MenuItem("Choose targets...", callback=open_settings)
-        self.menu = [self.toggle_item, None, self.settings_item]
+        self.timing_item = rumps.MenuItem("Adjust timing...", callback=open_timing)
+        self.menu = [self.toggle_item, None, self.settings_item, self.timing_item]
 
         # The menu bar icon is now the default entry point (install.sh's
         # login launcher runs this, not the daemon directly), so launching
-        # it must actually turn gating on -- not just show a stopped icon
-        # waiting for a manual click nobody asked for.
-        if not is_running():
+        # it must actually turn gating on for a fresh install -- not just
+        # show a stopped icon waiting for a manual click nobody asked for.
+        # But once the user has explicitly stopped it, a later relaunch of
+        # this app (login, crash recovery, manual restart) must respect
+        # that choice rather than silently turning gating back on.
+        if not is_running() and desired_running():
             start_daemon()
 
         self.tick(None)
@@ -195,6 +231,15 @@ class FokusKeeperStatusApp(rumps.App):
     def configure_status_item(self):
         item = self.status_item()
         if item is not None:
+            # rumps never gives its NSStatusItem an autosave name, so AppKit
+            # (and third-party menu bar managers like Ice, which track items
+            # by their persisted position) have no stable identity to anchor
+            # it to across relaunches -- a plausible reason the icon can
+            # exist but never render somewhere visible.
+            try:
+                item.setAutosaveName_("FokusKeeperStatusItem")
+            except AttributeError:
+                pass
             try:
                 item.setVisible_(True)
             except AttributeError:
@@ -228,8 +273,10 @@ class FokusKeeperStatusApp(rumps.App):
     def toggle(self, _sender):
         if self.on:
             stop_daemon()
+            set_desired_running(False)
         else:
             start_daemon()
+            set_desired_running(True)
         self.tick(None)
 
     def tick(self, _sender):

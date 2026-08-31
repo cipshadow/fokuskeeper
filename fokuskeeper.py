@@ -25,8 +25,6 @@ DAEMON_PROCESS_PATTERN = "python.*fokuskeeper.py"
 # so they get a much longer budget.
 SUBPROCESS_TIMEOUT_SECONDS = 10
 DIALOG_TIMEOUT_SECONDS = 600
-COOLDOWN_MINUTES = 3
-QUIET_PERIOD_MINUTES = 60  # skip the prompt if this app hasn't been used in this long
 LOG_FILE = Path.home() / "Library/Logs/fokuskeeper.log"
 STATE_FILE = Path.home() / ".fokuskeeper-state.json"
 HISTORY_FILE = Path.home() / ".fokuskeeper-history.json"
@@ -90,62 +88,112 @@ BROWSERS = (
 BROWSERS_BY_APP_NAME = {b.app_name: b for b in BROWSERS}
 
 
-# Config cache for load_enabled_targets(). The daemon calls the seam every
-# 0.5s tick, so we stat CONFIG_FILE (cheap) and only re-parse when the mtime
-# changes — which also picks up `fokuskeeper setup` edits from another process
-# without a restart. Keyed on (path, mtime_ns) so tests patching CONFIG_FILE
-# never see a stale entry.
-_config_cache = {"path": None, "mtime_ns": None, "targets": TARGETS}
+# Fallbacks when CONFIG_FILE is absent, unreadable, or a field in it is
+# missing/invalid. Each field falls back independently -- a bad
+# cooldown_minutes value never resets the enabled-targets list too.
+DEFAULT_COOLDOWN_MINUTES = 3
+DEFAULT_QUIET_PERIOD_MINUTES = 60
+
+# Config cache. The daemon calls enabled_targets()/cooldown_minutes()/
+# quiet_period_minutes() every 0.5s tick, so we stat CONFIG_FILE (cheap) and
+# only re-parse when the mtime changes — which also picks up `fokuskeeper
+# setup`/`fokuskeeper timing` edits from another process without a restart.
+# Keyed on (path, mtime_ns) so tests patching CONFIG_FILE never see a stale
+# entry.
+_config_cache = {
+    "path": None, "mtime_ns": None,
+    "targets": TARGETS,
+    "cooldown_minutes": DEFAULT_COOLDOWN_MINUTES,
+    "quiet_period_minutes": DEFAULT_QUIET_PERIOD_MINUTES,
+}
 
 
-def _parse_enabled_config(path):
-    """Parse CONFIG_FILE into a tuple of enabled Targets, in TARGETS order.
+def _positive_int_or(value, default, max_value=1440):
+    """A positive integer from a config value, else `default`.
 
-    Expected shape: {"enabled": ["slack", "gmail", ...]}. Unknown keys are
-    silently ignored. Any deviation — unreadable file, corrupt JSON, wrong
-    shape, empty/missing "enabled" list, or nothing left after filtering —
-    falls back to ALL targets (all-enabled is the default). Never raises.
+    Covers missing, wrong type, zero/negative, and absurdly large (a typo'd
+    extra digit or two shouldn't be able to wedge gating off for days --
+    capped at 1440 = 24h). Never raises.
     """
+    try:
+        value = int(value)
+    except (ValueError, TypeError):
+        return default
+    if value <= 0 or value > max_value:
+        return default
+    return value
+
+
+def _parse_config(path):
+    """Parse CONFIG_FILE into (targets, cooldown_minutes, quiet_period_minutes).
+
+    Expected shape: {"enabled": [...], "cooldown_minutes": N,
+    "quiet_period_minutes": N}. Unknown keys are silently ignored. Any
+    deviation in a field — missing, wrong type, out of bounds — falls back
+    to that field's own default, independently of the other fields. A
+    fully corrupt/unreadable/non-dict file falls back to all-defaults.
+    Never raises.
+    """
+    defaults = (TARGETS, DEFAULT_COOLDOWN_MINUTES, DEFAULT_QUIET_PERIOD_MINUTES)
     try:
         with open(path, "r") as f:
             data = json.load(f)
     except (json.JSONDecodeError, ValueError, OSError):
-        return TARGETS
+        return defaults
     if not isinstance(data, dict):
-        return TARGETS
+        return defaults
+
     enabled = data.get("enabled")
     if not isinstance(enabled, list) or not enabled:
-        return TARGETS
-    keys = {k for k in enabled if isinstance(k, str)}
-    targets = tuple(t for t in TARGETS if t.key in keys)
-    return targets or TARGETS
+        targets = TARGETS
+    else:
+        keys = {k for k in enabled if isinstance(k, str)}
+        targets = tuple(t for t in TARGETS if t.key in keys) or TARGETS
+
+    cooldown = _positive_int_or(data.get("cooldown_minutes"), DEFAULT_COOLDOWN_MINUTES)
+    quiet = _positive_int_or(data.get("quiet_period_minutes"), DEFAULT_QUIET_PERIOD_MINUTES)
+    return targets, cooldown, quiet
 
 
-def load_enabled_targets():
-    """Read the enabled-target set from CONFIG_FILE, mtime-cached."""
+def _load_config():
+    """Read CONFIG_FILE (targets + timing), mtime-cached."""
     global _config_cache
     path = CONFIG_FILE
     try:
         mtime_ns = os.stat(path).st_mtime_ns
     except OSError:
-        # File absent (or unstatable): all-enabled default.
-        return TARGETS
+        # File absent (or unstatable): all-defaults.
+        return TARGETS, DEFAULT_COOLDOWN_MINUTES, DEFAULT_QUIET_PERIOD_MINUTES
     cache = _config_cache
     if cache["path"] == path and cache["mtime_ns"] == mtime_ns:
-        return cache["targets"]
-    targets = _parse_enabled_config(path)
-    _config_cache = {"path": path, "mtime_ns": mtime_ns, "targets": targets}
-    return targets
+        return cache["targets"], cache["cooldown_minutes"], cache["quiet_period_minutes"]
+    targets, cooldown, quiet = _parse_config(path)
+    _config_cache = {
+        "path": path, "mtime_ns": mtime_ns,
+        "targets": targets, "cooldown_minutes": cooldown, "quiet_period_minutes": quiet,
+    }
+    return targets, cooldown, quiet
 
 
 def enabled_targets():
     """The targets the daemon currently intercepts.
 
     The seam all app/URL matching consults — never TARGETS directly. Backed
-    by CONFIG_FILE via load_enabled_targets(); stats/history/report keep
-    iterating ALL targets so disabled ones still show historical counts.
+    by CONFIG_FILE via _load_config(); stats/history/report keep iterating
+    ALL targets so disabled ones still show historical counts.
     """
-    return load_enabled_targets()
+    return _load_config()[0]
+
+
+def cooldown_minutes():
+    """Minutes a grant stays valid, live-configurable via CONFIG_FILE."""
+    return _load_config()[1]
+
+
+def quiet_period_minutes():
+    """Minutes of no use before the next open auto-allows, live-configurable
+    via CONFIG_FILE."""
+    return _load_config()[2]
 
 
 def match_app_name(app_name, targets=None):
@@ -433,7 +481,7 @@ def get_prevented_count(app_type="slack"):
 #
 # Until 2026-08-20 both were the single key `{app}_last_active_time`, and the
 # monitor loop refreshed it on every allowed focus. That made the cooldown a
-# *sliding* window: touching Slack once every COOLDOWN_MINUTES kept it alive
+# *sliding* window: touching Slack once every cooldown period kept it alive
 # forever and it never re-prompted. Diagnosed 2026-08-11, see SESSION_LOG.
 #
 # Legacy state is migrated on read, so an existing ~/.slack-gatekeeper-state.json
@@ -484,14 +532,14 @@ def is_in_cooldown(app_type="slack"):
     granted_at = _read_clock(load_state(), app_type, "granted_at")
     if granted_at is None:
         return False
-    return datetime.now() - granted_at < timedelta(minutes=COOLDOWN_MINUTES)
+    return datetime.now() - granted_at < timedelta(minutes=cooldown_minutes())
 
 def is_quiet_period(app_type="slack"):
-    """True if this app hasn't been touched in over QUIET_PERIOD_MINUTES."""
+    """True if this app hasn't been touched in over the quiet-period threshold."""
     last_seen = _read_clock(load_state(), app_type, "last_seen")
     if last_seen is None:
         return True
-    return datetime.now() - last_seen >= timedelta(minutes=QUIET_PERIOD_MINUTES)
+    return datetime.now() - last_seen >= timedelta(minutes=quiet_period_minutes())
 
 def is_app_running(app_name):
     """Check if an app's process is currently running (exact process name)."""
@@ -719,7 +767,7 @@ class Gate(Enum):
     """Outcome of the pre-prompt checks, in precedence order."""
     COOLDOWN = "cooldown"      # inside the grant window: silent allow
     FIRST_OPEN = "first_open"  # first open of the day: auto-allow
-    QUIET = "quiet"            # idle for QUIET_PERIOD_MINUTES+: auto-allow
+    QUIET = "quiet"            # idle for the quiet-period threshold+: auto-allow
     PROMPT = "prompt"          # none of the above: intercept and ask
 
 
@@ -799,7 +847,7 @@ def handle_intercept(target, surface):
     if gate is Gate.QUIET:
         new_count = increment_daily_count(key)
         allow_access(key)
-        log(f"No {target.label} use in {QUIET_PERIOD_MINUTES}+ min - auto-allowed (#{new_count})")
+        log(f"No {target.label} use in {quiet_period_minutes()}+ min - auto-allowed (#{new_count})")
         print(f"Quiet period - {target.label} allowed automatically")
         return True
 
@@ -954,7 +1002,7 @@ def allow_access(app_type="slack"):
     state[f"{app_type}_granted_at"] = now
     state[f"{app_type}_last_seen"] = now
     save_state(state)
-    log(f"Access allowed - {app_type} cooldown started ({COOLDOWN_MINUTES} min)")
+    log(f"Access allowed - {app_type} cooldown started ({cooldown_minutes()} min)")
 
 def monitor():
     """Main monitoring loop across all enabled targets (app + web surfaces)."""
@@ -980,22 +1028,21 @@ def monitor():
     print("  • Shows a dialog making you consciously decide if you need it")
     print("  • Tracks your daily stats and distractions blocked")
     print()
-    print(f"⏰ COOLDOWN PERIOD: {COOLDOWN_MINUTES} minutes")
-    print(f"  After clicking 'I have a reason', you get {COOLDOWN_MINUTES} minutes of")
+    print(f"⏰ COOLDOWN PERIOD: {cooldown_minutes()} minutes")
+    print(f"  After clicking 'I have a reason', you get {cooldown_minutes()} minutes of")
     print("  uninterrupted access. The timer starts at the grant and is not")
     print("  extended by continued use.")
     print()
-    print(f"🤫 QUIET PERIOD: {QUIET_PERIOD_MINUTES} minutes")
-    print(f"  If a target hasn't been used in {QUIET_PERIOD_MINUTES}+ minutes, the next")
+    print(f"🤫 QUIET PERIOD: {quiet_period_minutes()} minutes")
+    print(f"  If a target hasn't been used in {quiet_period_minutes()}+ minutes, the next")
     print("  open is let through without a prompt (checked per target).")
     print()
     print("💾 TIME RESCUED CALCULATION:")
     print("  Each blocked distraction saves ~10 minutes of focus time")
     print("  (average time spent checking + context switching cost)")
     print()
-    print("⚙️  CUSTOMIZE COOLDOWN:")
-    print(f"  Edit COOLDOWN_MINUTES in: {__file__}")
-    print(f"  Current value: {COOLDOWN_MINUTES} minutes")
+    print("⚙️  CUSTOMIZE TIMING:")
+    print("  Run 'fokuskeeper timing' or use the menu bar's Adjust timing... item")
     print()
     print("=" * 70)
     stats_line = ", ".join(
@@ -1104,7 +1151,7 @@ def cooldown_remaining_minutes(state, key):
     granted_at = _read_clock(state, key, "granted_at")
     if granted_at is None:
         return 0.0
-    remaining = timedelta(minutes=COOLDOWN_MINUTES) - (datetime.now() - granted_at)
+    remaining = timedelta(minutes=cooldown_minutes()) - (datetime.now() - granted_at)
     return max(0.0, remaining.total_seconds() / 60)
 
 def _today_counters(state):
@@ -1223,6 +1270,23 @@ def save_config(config):
     _write_json_file(CONFIG_FILE, config)
 
 
+def _read_raw_config():
+    """The current CONFIG_FILE contents as a dict, or {} if absent/corrupt.
+
+    Writers (run_setup, run_timing_settings) read this first and merge in
+    only their own field before saving — CONFIG_FILE holds independent
+    facets (enabled targets, cooldown, quiet period), and a writer that
+    saved its field alone would silently wipe out whatever the others had
+    already set.
+    """
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def run_setup():
     """Show the native multi-select target chooser and write CONFIG_FILE.
 
@@ -1238,10 +1302,10 @@ def run_setup():
         f'"{sanitize_for_applescript(t.label)}"' for t in TARGETS
     )
     # Pre-select the currently enabled set so re-running setup edits the
-    # existing selection. With no config, load_enabled_targets() returns all
+    # existing selection. With no config, enabled_targets() returns all
     # targets, so first-run behaviour is unchanged (everything selected).
     default_items = ", ".join(
-        f'"{sanitize_for_applescript(t.label)}"' for t in load_enabled_targets()
+        f'"{sanitize_for_applescript(t.label)}"' for t in enabled_targets()
     )
     script = (
         f"choose from list {{{items}}} "
@@ -1270,7 +1334,9 @@ def run_setup():
     # contain a comma, so a plain split is unambiguous.
     chosen = {label.strip() for label in output.split(",")}
     enabled = [t.key for t in TARGETS if t.label in chosen]  # TARGETS order
-    save_config({"enabled": enabled})
+    config = _read_raw_config()
+    config["enabled"] = enabled
+    save_config(config)
     log(f"Setup saved: enabled targets = {', '.join(enabled) or 'none'}")
     return enabled
 
@@ -1280,6 +1346,69 @@ def cmd_setup():
     run_setup()
     labels = ", ".join(t.label for t in enabled_targets())
     print(f"Enabled targets: {labels}")
+
+
+def _prompt_for_minutes(prompt_text, current_value):
+    """One native numeric-input dialog. Returns the new positive int, or
+    None if the user cancelled, the dialog failed, or the input wasn't a
+    valid positive number (caller keeps the existing value in every case).
+    """
+    script = (
+        f'display dialog "{sanitize_for_applescript(prompt_text)}" '
+        f'with title "FokusKeeper - Timing" '
+        f'default answer "{current_value}"'
+    )
+    result = _run(["osascript", "-e", script], timeout=DIALOG_TIMEOUT_SECONDS)
+    if result.returncode != 0:
+        # Cancel button, Escape, or osascript failure (e.g. headless) all
+        # raise a non-zero exit here — unlike choose from list's "false".
+        return None
+    answer = result.stdout.rpartition("text returned:")[2].strip()
+    return _positive_int_or(answer, default=None)
+
+
+def run_timing_settings():
+    """Show two native prompts to edit cooldown/quiet-period minutes,
+    merging the result into CONFIG_FILE.
+
+    Returns (cooldown, quiet) written, or None if the user cancelled or
+    entered something invalid at either step — the existing config (and
+    the other field, if only one step was reached) is left untouched.
+    """
+    new_cooldown = _prompt_for_minutes(
+        'Cooldown: after clicking "I have a reason," how many minutes '
+        "of uninterrupted access before FokusKeeper asks again?",
+        cooldown_minutes(),
+    )
+    if new_cooldown is None:
+        log("Timing settings cancelled or invalid cooldown - config left untouched")
+        return None
+
+    new_quiet = _prompt_for_minutes(
+        "Quiet period: after this many minutes of NOT using a target, the "
+        "next time you open it is let through automatically, without asking.",
+        quiet_period_minutes(),
+    )
+    if new_quiet is None:
+        log("Timing settings cancelled or invalid quiet period - config left untouched")
+        return None
+
+    config = _read_raw_config()
+    config["cooldown_minutes"] = new_cooldown
+    config["quiet_period_minutes"] = new_quiet
+    save_config(config)
+    log(f"Timing saved: cooldown={new_cooldown}min, quiet_period={new_quiet}min")
+    return (new_cooldown, new_quiet)
+
+
+def cmd_timing():
+    """`fokuskeeper timing`: run the two prompts, then print the result."""
+    result = run_timing_settings()
+    if result is None:
+        print("Timing settings unchanged.")
+    else:
+        new_cooldown, new_quiet = result
+        print(f"Cooldown: {new_cooldown} minutes. Quiet period: {new_quiet} minutes.")
 
 
 def cmd_run():
@@ -1326,11 +1455,12 @@ def main(argv=None):
         nargs="?",
         default="run",
         choices=["run", "stats", "status", "history", "report", "reset",
-                 "setup"],
+                 "setup", "timing"],
         help="run: start the monitor daemon (default); stats: today's numbers; "
              "status: daemon liveness + stats; history: last 7 days; "
              "report: all-time totals; reset: zero today's counters; "
-             "setup: choose which targets to gate",
+             "setup: choose which targets to gate; "
+             "timing: adjust the cooldown and quiet-period minutes",
     )
     args = parser.parse_args(argv)
 
@@ -1346,6 +1476,7 @@ def main(argv=None):
         "report": cmd_report,
         "reset": cmd_reset,
         "setup": cmd_setup,
+        "timing": cmd_timing,
     }
     dispatch[args.command]()
 

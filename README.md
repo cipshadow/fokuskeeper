@@ -48,12 +48,12 @@ A Python daemon (`fokuskeeper.py`, stdlib only) polls the frontmost application 
 
 On each detected open, the gate decides in strict precedence order:
 
-1. **Cooldown**: within 3 minutes of a grant, allow silently.
+1. **Cooldown**: within the cooldown window (default 3 minutes) of a grant, allow silently.
 2. **First open of the day**: auto-allow (you get one free check).
-3. **Quiet period**: no use of that target in 60+ minutes, auto-allow.
+3. **Quiet period**: no use of that target in the quiet-period window (default 60 minutes), auto-allow.
 4. **Prompt**: block the surface and show the dialog.
 
-Cooldowns are shared per target across surfaces: allowing the Slack app also covers app.slack.com in your browser for the same 3 minutes. The cooldown clock is fixed at the moment of the grant; continued use does not extend it.
+Cooldowns are shared per target across surfaces: allowing the Slack app also covers app.slack.com in your browser for the same window. The cooldown clock is fixed at the moment of the grant; continued use does not extend it. Both windows are adjustable -- see **Customization** below.
 
 ## Prerequisites
 
@@ -74,7 +74,7 @@ The installer checks for `python3`, sets up a menu bar icon (a small `.venv` wit
 
 If the menu bar setup can't complete (no network, or no build tools for one of its dependencies), install continues anyway with a plain headless daemon — no menu bar icon, but gating still works fully. Retry the menu bar setup any time with `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && ./start-menubar.sh`, then re-run `./install.sh` to regenerate the login launcher so it picks it up automatically.
 
-On first run a short welcome screen explains how the dialog and cooldown work, then a native chooser lists all ten targets, pre-selected; deselect any you want ungated. Your choice is saved to `~/.fokuskeeper-config.json`. Change it again any time from the menu bar icon's **Choose targets...** menu item.
+On first run a short welcome screen explains how the dialog and cooldown work, then a native chooser lists all ten targets, pre-selected; deselect any you want ungated. Your choice is saved to `~/.fokuskeeper-config.json`. Change it again any time from the menu bar icon's **Choose targets...** menu item, or adjust cooldown/quiet-period minutes from **Adjust timing...**.
 
 ### Permissions
 
@@ -95,6 +95,7 @@ Grants are **per launching app**: the daemon started from your terminal and the 
 ./fokuskeeper report     # all-time totals
 ./fokuskeeper reset      # zero today's counters (cooldowns survive)
 ./fokuskeeper setup      # re-run the target chooser
+./fokuskeeper timing     # adjust cooldown / quiet-period minutes
 ```
 
 Sample `stats` output:
@@ -111,7 +112,7 @@ FokusKeeper - Today's stats (2026-08-30)
 ## Customization
 
 - **Targets**: click **Choose targets...** in the menu bar icon's menu, or run `./fokuskeeper setup` from a terminal -- both reopen the same chooser. Changes apply live; the daemon watches the config file's mtime, no restart needed.
-- **Timing**: edit `COOLDOWN_MINUTES` (default 3) and `QUIET_PERIOD_MINUTES` (default 60) at the top of `fokuskeeper.py`, then restart the daemon. Deliberate v1 choice: these live in code, not a config file.
+- **Timing**: click **Adjust timing...** in the menu bar icon's menu, or run `./fokuskeeper timing` from a terminal -- both prompt for the cooldown and quiet-period minutes (1-1440 each), pre-filled with the current values. Cancelling either prompt leaves both settings untouched. Applies live, same as targets.
 - **Menu bar icon**: installed by default (see Install above). A shield-with-K icon shows daemon state; click it to start/stop. To start it manually without logging out and back in, run `./start-menubar.sh` — it prefers the repo's `.venv` automatically and starts the daemon itself if it isn't already running.
 
 ## Uninstall
@@ -151,6 +152,9 @@ One short `osascript` call per tick (two while a supported browser is frontmost)
 
 **I upgraded from the old version. Where are my stats?**
 Legacy `~/.slack-gatekeeper-*.json` files are copied to the new names automatically on first run; the originals stay in place as rollback.
+
+**I can't find the menu bar icon.**
+The daemon and gating still work either way -- the icon is a convenience, not a dependency. If you run a menu bar organizer (Bartender, Ice, and similar), check its hidden/overflow section first; some are configured to auto-hide inactive icons. Either way, `./fokuskeeper start|stop|status` from a terminal always works regardless of icon visibility.
 
 ## License
 
