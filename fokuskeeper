@@ -1,6 +1,6 @@
 #!/bin/bash
 # FokusKeeper CLI — process management for the FokusKeeper daemon.
-# Data commands (stats, history, report, reset, setup, timing) are delegated to
+# Data commands (stats, history, report, reset, settings) are delegated to
 # fokuskeeper.py, which owns all state and reporting logic.
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,8 +43,7 @@ usage() {
     echo "  history   - Last 7 days"
     echo "  report    - Comprehensive all-time report"
     echo "  reset     - Reset today's counts"
-    echo "  setup     - Interactive configuration"
-    echo "  timing    - Adjust cooldown/quiet-period minutes"
+    echo "  settings  - Choose apps and adjust cooldown/quiet-period minutes"
 }
 
 case "$1" in
@@ -90,7 +89,7 @@ case "$1" in
         echo ""
         echo "Daemon stdout log: $STDOUT_LOG"
         ;;
-    stats|history|report|reset|setup|timing)
+    stats|history|report|reset|settings)
         exec "$PY" "$DIR/fokuskeeper.py" "$1"
         ;;
     *)

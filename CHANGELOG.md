@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 - 2026-08-31
+
+- Renamed "targets" to "apps" throughout the UI, dialogs, and docs.
+- **Choose targets...** and **Adjust timing...** are now one combined **Settings...** flow (`fokuskeeper settings`): app chooser, then cooldown, then quiet period, in one visit.
+- Reworded the cooldown and quiet-period prompts with concrete examples of what each setting means in practice.
+
 ## 1.1.0 - 2026-08-31
 
 - Cooldown and quiet-period minutes are now configurable: **Adjust timing...** in the menu bar, or `fokuskeeper timing` from a terminal. Both prompts pre-fill the current value; cancelling either one leaves both settings untouched.
