@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0 - 2026-08-31
+
+- Cooldown and quiet-period minutes are now configurable: **Adjust timing...** in the menu bar, or `fokuskeeper timing` from a terminal. Both prompts pre-fill the current value; cancelling either one leaves both settings untouched.
+- Fixed: relaunching the menu bar app (login, crash recovery, manual restart) no longer silently restarts the daemon after you'd deliberately stopped it. Your last explicit start/stop choice is now remembered.
+- Fixed: `fokuskeeper setup` no longer wipes previously-saved timing settings when it saves the target selection.
+- Gave the menu bar status item a stable autosave name, so third-party menu bar managers (Bartender, Ice, and similar) can persist its position instead of losing track of it across relaunches.
+
 ## 1.0.0 - 2026-08-30
 
 First public release.

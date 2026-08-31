@@ -180,7 +180,7 @@ class TestCooldownAndQuietPeriod:
         with patch.object(sg, 'STATE_FILE', self.temp_state_file), \
              patch.object(sg, 'log'):
             sg.allow_access("slack")
-            self._backdate("slack_granted_at", sg.COOLDOWN_MINUTES + 2)
+            self._backdate("slack_granted_at", sg.DEFAULT_COOLDOWN_MINUTES + 2)
 
             for _ in range(5):
                 sg.update_last_seen("slack")
@@ -191,7 +191,7 @@ class TestCooldownAndQuietPeriod:
         with patch.object(sg, 'STATE_FILE', self.temp_state_file), \
              patch.object(sg, 'log'):
             sg.allow_access("slack")
-            self._backdate("slack_granted_at", max(sg.COOLDOWN_MINUTES - 1, 0))
+            self._backdate("slack_granted_at", max(sg.DEFAULT_COOLDOWN_MINUTES - 1, 0))
             sg.update_last_seen("slack")
             assert sg.is_in_cooldown("slack") is True
 
@@ -206,7 +206,7 @@ class TestCooldownAndQuietPeriod:
             sg.update_last_seen("slack")
             assert sg.is_quiet_period("slack") is False
 
-            self._backdate("slack_last_seen", sg.QUIET_PERIOD_MINUTES + 30)
+            self._backdate("slack_last_seen", sg.DEFAULT_QUIET_PERIOD_MINUTES + 30)
             assert sg.is_quiet_period("slack") is True
 
     def test_quiet_period_true_when_never_seen(self):
@@ -225,7 +225,7 @@ class TestCooldownAndQuietPeriod:
             sg.save_state({
                 "slack_last_active_time":
                     (datetime.now() - timedelta(
-                        minutes=sg.QUIET_PERIOD_MINUTES + 10)).isoformat()
+                        minutes=sg.DEFAULT_QUIET_PERIOD_MINUTES + 10)).isoformat()
             })
             assert sg.is_in_cooldown("slack") is False
             assert sg.is_quiet_period("slack") is True
@@ -359,7 +359,7 @@ class TestStatsCommand(_TempCliMixin):
     def test_cooldown_remaining_derives_from_granted_at(self):
         granted = (datetime.now() - timedelta(minutes=1)).isoformat()
         state = {"slack_granted_at": granted}
-        with patch.object(sg, 'COOLDOWN_MINUTES', 3):
+        with patch.object(sg, 'cooldown_minutes', return_value=3):
             remaining = sg.cooldown_remaining_minutes(state, "slack")
         assert 1.8 <= remaining <= 2.0
 
@@ -371,7 +371,7 @@ class TestStatsCommand(_TempCliMixin):
             "slack_prevented": 1,
             "slack_granted_at": granted,
         }))
-        with patch.object(sg, 'COOLDOWN_MINUTES', 3):
+        with patch.object(sg, 'cooldown_minutes', return_value=3):
             self._run_main(["stats"])
         out = capsys.readouterr().out
 
@@ -511,7 +511,7 @@ class TestGatePrecedence(_TempStateMixin):
             "stats_date": sg.get_today_date(),
             "slack_opens": 3,
             "slack_last_seen": (datetime.now() - timedelta(
-                minutes=sg.QUIET_PERIOD_MINUTES + 5)).isoformat(),
+                minutes=sg.DEFAULT_QUIET_PERIOD_MINUTES + 5)).isoformat(),
         })
         assert gate is sg.Gate.QUIET
 
@@ -821,6 +821,122 @@ class TestEnabledTargetsConfig(_TempConfigMixin):
                 p.stop()
 
 
+class TestPositiveIntOr:
+    """_positive_int_or(): the shared validator behind both timing fields."""
+
+    def test_valid_int_passes_through(self):
+        assert sg._positive_int_or(5, default=99) == 5
+
+    def test_numeric_string_coerces(self):
+        assert sg._positive_int_or("5", default=99) == 5
+
+    def test_missing_or_wrong_type_falls_back(self):
+        assert sg._positive_int_or(None, default=99) == 99
+        assert sg._positive_int_or("not a number", default=99) == 99
+        assert sg._positive_int_or([5], default=99) == 99
+
+    def test_zero_and_negative_fall_back(self):
+        assert sg._positive_int_or(0, default=99) == 99
+        assert sg._positive_int_or(-5, default=99) == 99
+
+    def test_absurdly_large_falls_back(self):
+        # A typo'd extra digit or two shouldn't be able to wedge gating off
+        # for days -- capped at 1440 (24h) by default.
+        assert sg._positive_int_or(1440, default=99) == 1440
+        assert sg._positive_int_or(1441, default=99) == 99
+        assert sg._positive_int_or(99999, default=99) == 99
+
+
+class TestTimingConfig(_TempConfigMixin):
+    """cooldown_minutes()/quiet_period_minutes() read CONFIG_FILE, live-configurable."""
+
+    def _values(self):
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            return sg.cooldown_minutes(), sg.quiet_period_minutes()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_absent_config_uses_defaults(self):
+        assert self._values() == (sg.DEFAULT_COOLDOWN_MINUTES, sg.DEFAULT_QUIET_PERIOD_MINUTES)
+
+    def test_custom_values_are_honoured(self):
+        self.config_file.write_text(json.dumps({"cooldown_minutes": 10, "quiet_period_minutes": 120}))
+        assert self._values() == (10, 120)
+
+    def test_invalid_cooldown_falls_back_independently(self):
+        # A bad cooldown_minutes must not also reset a valid quiet_period_minutes.
+        self.config_file.write_text(json.dumps({"cooldown_minutes": -5, "quiet_period_minutes": 120}))
+        assert self._values() == (sg.DEFAULT_COOLDOWN_MINUTES, 120)
+
+    def test_invalid_quiet_period_falls_back_independently(self):
+        self.config_file.write_text(json.dumps({"cooldown_minutes": 10, "quiet_period_minutes": "lots"}))
+        assert self._values() == (10, sg.DEFAULT_QUIET_PERIOD_MINUTES)
+
+    def test_bad_field_does_not_reset_enabled_targets(self):
+        # One corrupt field must not take down the other two independent
+        # config facets (targets, cooldown, quiet period).
+        self.config_file.write_text(json.dumps({
+            "enabled": ["reddit"], "cooldown_minutes": -1, "quiet_period_minutes": 120,
+        }))
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            assert tuple(t.key for t in sg.enabled_targets()) == ("reddit",)
+            assert sg.cooldown_minutes() == sg.DEFAULT_COOLDOWN_MINUTES
+            assert sg.quiet_period_minutes() == 120
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_mtime_reload_picks_up_timing_changes(self):
+        import os as _os
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            self.config_file.write_text(json.dumps({"cooldown_minutes": 5}))
+            assert sg.cooldown_minutes() == 5
+
+            self.config_file.write_text(json.dumps({"cooldown_minutes": 15}))
+            stat = self.config_file.stat()
+            _os.utime(self.config_file,
+                      ns=(stat.st_atime_ns, stat.st_mtime_ns + 10_000_000))
+            assert sg.cooldown_minutes() == 15
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_gate_evaluation_uses_configured_cooldown(self):
+        # A live, end-to-end check that evaluate_gate actually consults the
+        # configured cooldown, not just that the getter returns it.
+        self.config_file.write_text(json.dumps({"cooldown_minutes": 30}))
+        state_dir = Path(tempfile.mkdtemp())
+        state_file = state_dir / "state.json"
+        try:
+            patches = self._patches() + [patch.object(sg, 'STATE_FILE', state_file)]
+            for p in patches:
+                p.start()
+            try:
+                sg.allow_access("slack")
+                # 20 minutes in: still inside a 30-minute cooldown, but would
+                # have expired under the default 3-minute one.
+                state = sg.load_state()
+                state["slack_granted_at"] = (datetime.now() - timedelta(minutes=20)).isoformat()
+                sg.save_state(state)
+                assert sg.is_in_cooldown("slack") is True
+            finally:
+                for p in patches:
+                    p.stop()
+        finally:
+            import shutil
+            shutil.rmtree(state_dir)
+
+
 class TestRunSetup(_TempConfigMixin):
     """run_setup(): native chooser, cancel-safe, writes CONFIG_FILE 0o600."""
 
@@ -868,6 +984,96 @@ class TestRunSetup(_TempConfigMixin):
             assert target.label in script, target.label
         assert "with multiple selections allowed" in script
         assert "default items" in script
+
+    def test_selection_preserves_existing_timing_settings(self):
+        # Regression: run_setup() used to save_config({"enabled": [...]})
+        # wholesale, silently wiping out any cooldown/quiet_period_minutes
+        # a prior `fokuskeeper timing` run had already saved.
+        self.config_file.write_text(json.dumps({
+            "enabled": ["gmail"], "cooldown_minutes": 10, "quiet_period_minutes": 90,
+        }))
+        self._run_setup("Reddit, Slack\n")
+        assert json.loads(self.config_file.read_text()) == {
+            "enabled": ["slack", "reddit"],
+            "cooldown_minutes": 10,
+            "quiet_period_minutes": 90,
+        }
+
+
+class TestPromptForMinutes:
+    """_prompt_for_minutes(): one native numeric-input dialog."""
+
+    def _prompt(self, stdout, returncode=0):
+        mock_result = MagicMock(returncode=returncode, stdout=stdout)
+        with patch.object(sg, '_run', return_value=mock_result):
+            return sg._prompt_for_minutes("How many minutes?", 3)
+
+    def test_valid_answer_parses(self):
+        assert self._prompt("button returned:OK, text returned:10\n") == 10
+
+    def test_non_numeric_answer_returns_none(self):
+        assert self._prompt("button returned:OK, text returned:banana\n") is None
+
+    def test_zero_or_negative_answer_returns_none(self):
+        assert self._prompt("button returned:OK, text returned:0\n") is None
+        assert self._prompt("button returned:OK, text returned:-5\n") is None
+
+    def test_cancel_returns_none(self):
+        # display dialog raises a non-zero exit on Cancel/Escape -- unlike
+        # choose from list's exit-0 literal "false".
+        assert self._prompt("", returncode=1) is None
+
+
+class TestRunTimingSettings(_TempConfigMixin):
+    """run_timing_settings(): two native prompts, cancel-safe, merges CONFIG_FILE."""
+
+    def _run_timing(self, answers):
+        """answers: list of (stdout, returncode) for each successive _run call."""
+        results = [MagicMock(returncode=rc, stdout=out) for out, rc in answers]
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            with patch.object(sg, '_run', side_effect=results):
+                return sg.run_timing_settings()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_both_valid_writes_config(self):
+        result = self._run_timing([
+            ("button returned:OK, text returned:10\n", 0),
+            ("button returned:OK, text returned:90\n", 0),
+        ])
+        assert result == (10, 90)
+        assert json.loads(self.config_file.read_text()) == \
+            {"cooldown_minutes": 10, "quiet_period_minutes": 90}
+        assert (self.config_file.stat().st_mode & 0o777) == 0o600
+
+    def test_cancel_at_first_prompt_writes_nothing(self):
+        result = self._run_timing([("", 1)])
+        assert result is None
+        assert not self.config_file.exists()
+
+    def test_cancel_at_second_prompt_writes_nothing_not_even_the_first(self):
+        # "Both or nothing": a valid cooldown entered before cancelling on
+        # the quiet-period prompt must not be saved half-finished.
+        result = self._run_timing([
+            ("button returned:OK, text returned:10\n", 0),
+            ("", 1),
+        ])
+        assert result is None
+        assert not self.config_file.exists()
+
+    def test_preserves_existing_enabled_targets(self):
+        self.config_file.write_text(json.dumps({"enabled": ["reddit"]}))
+        self._run_timing([
+            ("button returned:OK, text returned:10\n", 0),
+            ("button returned:OK, text returned:90\n", 0),
+        ])
+        assert json.loads(self.config_file.read_text()) == {
+            "enabled": ["reddit"], "cooldown_minutes": 10, "quiet_period_minutes": 90,
+        }
 
 
 class _RecordingSurface:
@@ -959,7 +1165,7 @@ class TestHandleIntercept(_TempStateMixin):
             "stats_date": sg.get_today_date(),
             "slack_opens": 2,
             "slack_last_seen": (datetime.now() - timedelta(
-                minutes=sg.QUIET_PERIOD_MINUTES + 5)).isoformat(),
+                minutes=sg.DEFAULT_QUIET_PERIOD_MINUTES + 5)).isoformat(),
         }
         allowed, mock_dialog = self._intercept(seed)
 
@@ -1019,7 +1225,7 @@ class TestRefreshLastSeen(_TempStateMixin):
         try:
             sg.save_state({
                 "slack_granted_at": (datetime.now() - timedelta(
-                    minutes=sg.COOLDOWN_MINUTES + 5)).isoformat(),
+                    minutes=sg.DEFAULT_COOLDOWN_MINUTES + 5)).isoformat(),
                 "slack_last_seen": (datetime.now() - timedelta(
                     seconds=sg.LAST_SEEN_REFRESH_SECONDS + 10)).isoformat(),
             })

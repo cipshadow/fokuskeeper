@@ -1,12 +1,16 @@
 #!/bin/bash
 # FokusKeeper CLI — process management for the FokusKeeper daemon.
-# Data commands (stats, history, report, reset, setup) are delegated to
+# Data commands (stats, history, report, reset, setup, timing) are delegated to
 # fokuskeeper.py, which owns all state and reporting logic.
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$HOME/Library/Logs/fokuskeeper.log"
 STDOUT_LOG="$HOME/Library/Logs/fokuskeeper-stdout.log"
 PATTERN='python.*fokuskeeper.py'
+# Shared with fokuskeeper_menubar.py: records the user's last explicit
+# start/stop choice, so a later menu bar app relaunch (login, crash
+# recovery) doesn't silently override a deliberate `stop` from here.
+DESIRED_STATE_FILE="$HOME/.fokuskeeper-desired-state"
 mkdir -p "$(dirname "$LOG_FILE")"
 
 if [ -x "$DIR/.venv/bin/python3" ]; then
@@ -40,6 +44,7 @@ usage() {
     echo "  report    - Comprehensive all-time report"
     echo "  reset     - Reset today's counts"
     echo "  setup     - Interactive configuration"
+    echo "  timing    - Adjust cooldown/quiet-period minutes"
 }
 
 case "$1" in
@@ -56,6 +61,7 @@ case "$1" in
         nohup "$PY" -u fokuskeeper.py run > "$STDOUT_LOG" 2>&1 &
         sleep 1
         if is_running; then
+            echo "on" > "$DESIRED_STATE_FILE"
             echo "FokusKeeper started."
         else
             echo "FokusKeeper failed to start. Check: $STDOUT_LOG" >&2
@@ -64,6 +70,7 @@ case "$1" in
         ;;
     stop)
         pkill -f -u "$(id -u)" "$PATTERN"
+        echo "off" > "$DESIRED_STATE_FILE"
         echo "FokusKeeper stopped."
         ;;
     restart)
@@ -83,7 +90,7 @@ case "$1" in
         echo ""
         echo "Daemon stdout log: $STDOUT_LOG"
         ;;
-    stats|history|report|reset|setup)
+    stats|history|report|reset|setup|timing)
         exec "$PY" "$DIR/fokuskeeper.py" "$1"
         ;;
     *)
