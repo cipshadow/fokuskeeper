@@ -17,7 +17,6 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 # Configuration
-CHROME_APP_NAME = "Google Chrome"
 # pgrep/pkill pattern for the daemon process. Deliberately `python.*` + script
 # name so an editor session with the file open never matches.
 DAEMON_PROCESS_PATTERN = "python.*fokuskeeper.py"
@@ -65,6 +64,30 @@ TARGETS = (
 TARGETS_BY_KEY = {t.key: t for t in TARGETS}
 TARGET_KEYS = tuple(t.key for t in TARGETS)
 TARGET_LABELS = {t.key: t.label for t in TARGETS}
+
+
+@dataclass(frozen=True)
+class Browser:
+    key: str
+    app_name: str
+    current_tab_phrase: str  # AppleScript wording for "the tab you're looking at"
+    # Chrome exposes a numeric id on both windows and tabs, so a restore can
+    # target the exact tab even if others moved or closed meanwhile. Safari's
+    # AppleScript dictionary has no tab id at all (verified live -- `id of
+    # current tab` raises -1728) -- only `index`, which drifts the same way.
+    # For a browser without one, we track only the window id and always
+    # operate on "current tab of window W" (verified as a stable, working
+    # handle). Narrower race than Chrome's: if the user switches tabs within
+    # that same window during the ~1s the dialog takes to appear, the
+    # restore lands on whatever tab is current then -- not necessarily the
+    # one that was flagged. Accepted limitation, not present for Chrome.
+    has_tab_ids: bool
+
+BROWSERS = (
+    Browser("chrome", "Google Chrome", "active tab", has_tab_ids=True),
+    Browser("safari", "Safari", "current tab", has_tab_ids=False),
+)
+BROWSERS_BY_APP_NAME = {b.app_name: b for b in BROWSERS}
 
 
 # Config cache for load_enabled_targets(). The daemon calls the seam every
@@ -503,13 +526,13 @@ def quit_app(app_name):
     )
     return False
 
-def get_chrome_active_tab_url():
-    """Get the URL of the active tab in Chrome."""
-    script = '''
-    tell application "Google Chrome"
+def get_browser_active_tab_url(browser):
+    """Get the URL of the active tab in the given browser."""
+    script = f'''
+    tell application "{browser.app_name}"
         if it is running then
             try
-                get URL of active tab of front window
+                get URL of {browser.current_tab_phrase} of front window
             on error
                 return ""
             end try
@@ -522,10 +545,10 @@ def get_chrome_active_tab_url():
     if result.returncode == 0:
         return result.stdout.strip()
     _warn_access_once(
-        "chrome_tabs",
-        "Cannot read Chrome tabs - web gating is inactive. Grant Automation "
-        f"permission for Google Chrome to the app that starts FokusKeeper "
-        f"({result.stderr.strip() or 'unknown osascript error'}).",
+        f"{browser.key}_tabs",
+        f"Cannot read {browser.app_name} tabs - web gating for it is inactive. "
+        f"Grant Automation permission for {browser.app_name} to the app that "
+        f"starts FokusKeeper ({result.stderr.strip() or 'unknown osascript error'}).",
     )
     return ""
 
@@ -546,22 +569,45 @@ def _warn_access_once(key, message):
     _access_warned.add(key)
     log(f"WARNING: {message} Check the Permissions section of the README.")
 
-def get_chrome_front_tab_ref():
-    """Identify the front Chrome window and its active tab by ID.
+def get_browser_front_tab_ref(browser):
+    """Identify the front window (and, for browsers that support it, the
+    exact tab within it) so a restore lands back in the same place.
 
-    Targeting the exact (window, tab) pair is what keeps a restored tab in
-    the Chrome profile it came from — "active tab of front window" can drift to
-    another profile's window between detection and restore.
+    Returns (window_id, tab_id). tab_id is None for a browser without a
+    stable per-tab id (Safari — see Browser.has_tab_ids); callers then
+    always target "current tab of window W" instead of a specific tab.
 
-    This is the ONLY place tab/window ids may come from: it validates both as
-    digits, which is what makes interpolating them into _tell_tab safe.
+    This is the ONLY place tab/window ids may come from: it validates every
+    id as digits, which is what makes interpolating them into _tell_tab safe.
     """
-    script = '''
-    tell application "Google Chrome"
+    if browser.has_tab_ids:
+        script = f'''
+        tell application "{browser.app_name}"
+            if it is running then
+                try
+                    set w to front window
+                    return (id of w as string) & "|" & (id of {browser.current_tab_phrase} of w as string)
+                on error
+                    return ""
+                end try
+            else
+                return ""
+            end if
+        end tell
+        '''
+        result = _run(["osascript", "-e", script])
+        if result.returncode != 0:
+            return (None, None)
+        parts = result.stdout.strip().split("|")
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            return (None, None)
+        return (int(parts[0]), int(parts[1]))
+
+    script = f'''
+    tell application "{browser.app_name}"
         if it is running then
             try
-                set w to front window
-                return (id of w as string) & "|" & (id of active tab of w as string)
+                return id of front window as string
             on error
                 return ""
             end try
@@ -571,80 +617,97 @@ def get_chrome_front_tab_ref():
     end tell
     '''
     result = _run(["osascript", "-e", script])
-    if result.returncode != 0:
+    if result.returncode != 0 or not result.stdout.strip().isdigit():
         return (None, None)
-    parts = result.stdout.strip().split("|")
-    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-        return (None, None)
-    return (int(parts[0]), int(parts[1]))
+    return (int(result.stdout.strip()), None)
 
 
-def _tell_tab(window_id, tab_id, body):
+def _tell_tab(browser, window_id, tab_id, body):
     """Run an AppleScript body against a specific tab, returning True on success.
 
-    IDs are matched as strings: AppleScript coerces 9-digit ids to single-precision
-    reals in `whose id is N` comparisons, which can match a neighbouring tab.
+    When tab_id is set, ids are matched as strings: AppleScript coerces
+    9-digit ids to single-precision reals in `whose id is N` comparisons,
+    which can match a neighbouring tab. When tab_id is None (a browser
+    without tab ids), targets "current tab of window W" instead — see
+    Browser.has_tab_ids for the narrower race this accepts.
     """
-    script = f'''
-    tell application "Google Chrome"
-        try
-            set targetWindow to missing value
-            repeat with w in windows
-                if (id of w as string) is "{window_id}" then
-                    set targetWindow to w
-                    exit repeat
-                end if
-            end repeat
-            if targetWindow is missing value then error "window {window_id} not found"
+    if tab_id is not None:
+        script = f'''
+        tell application "{browser.app_name}"
+            try
+                set targetWindow to missing value
+                repeat with w in windows
+                    if (id of w as string) is "{window_id}" then
+                        set targetWindow to w
+                        exit repeat
+                    end if
+                end repeat
+                if targetWindow is missing value then error "window {window_id} not found"
 
-            set targetTab to missing value
-            repeat with t in tabs of targetWindow
-                if (id of t as string) is "{tab_id}" then
-                    set targetTab to t
-                    exit repeat
-                end if
-            end repeat
-            if targetTab is missing value then error "tab {tab_id} not found"
+                set targetTab to missing value
+                repeat with t in tabs of targetWindow
+                    if (id of t as string) is "{tab_id}" then
+                        set targetTab to t
+                        exit repeat
+                    end if
+                end repeat
+                if targetTab is missing value then error "tab {tab_id} not found"
 
-            {body}
-            return "ok"
-        on error errMsg
-            return "err: " & errMsg
-        end try
-    end tell
-    '''
+                {body}
+                return "ok"
+            on error errMsg
+                return "err: " & errMsg
+            end try
+        end tell
+        '''
+    else:
+        script = f'''
+        tell application "{browser.app_name}"
+            try
+                if not (exists window id {window_id}) then error "window {window_id} not found"
+                tell window id {window_id}
+                    set targetTab to current tab
+                end tell
+
+                {body}
+                return "ok"
+            on error errMsg
+                return "err: " & errMsg
+            end try
+        end tell
+        '''
     result = _run(["osascript", "-e", script])
     output = result.stdout.strip()
     if output == "ok":
         return True
-    log(f"Chrome tab operation failed (window {window_id}, tab {tab_id}): {output}")
+    log(f"{browser.app_name} tab operation failed (window {window_id}, tab {tab_id}): {output}")
     return False
 
 
-def park_tab(window_id, tab_id, label):
+def park_tab(browser, window_id, tab_id, label):
     """Blank out the tab without closing it, so its window/profile survives."""
-    if window_id is None or tab_id is None:
+    if window_id is None:
         log(f"Could not identify the {label} tab - leaving it alone")
         return False
-    if _tell_tab(window_id, tab_id, 'set URL of targetTab to "about:blank"'):
+    if _tell_tab(browser, window_id, tab_id, 'set URL of targetTab to "about:blank"'):
         log(f"Parked {label} tab at about:blank")
         return True
     return False
 
 
-def restore_tab(window_id, tab_id, original_url, label):
+def restore_tab(browser, window_id, tab_id, original_url, label):
     """Restore the parked tab to the exact URL it was on (same window/profile)."""
     safe_url = sanitize_for_applescript(original_url)
-    if _tell_tab(window_id, tab_id, f'set URL of targetTab to "{safe_url}"'):
+    if _tell_tab(browser, window_id, tab_id, f'set URL of targetTab to "{safe_url}"'):
         log(f"Restored {label} tab in original window/profile: {_hostname_for_log(original_url)}")
         return True
     log(f"Could not restore the original {label} tab - not opening {label} elsewhere")
     return False
 
 
-def discard_parked_tab(window_id, tab_id, label):
+def discard_parked_tab(browser, window_id, tab_id, label):
     """Close the parked tab after access is denied."""
-    if _tell_tab(window_id, tab_id, "close targetTab"):
+    if _tell_tab(browser, window_id, tab_id, "close targetTab"):
         log(f"Closed parked {label} tab")
 
 
@@ -693,26 +756,27 @@ class AppSurface:
 
 
 class WebSurface:
-    """A target intercepted as a Chrome tab (park on block, restore URL, close on discard).
+    """A target intercepted as a browser tab (park on block, restore URL, close on discard).
 
-    window_id/tab_id must come from get_chrome_front_tab_ref() — the only
+    window_id/tab_id must come from get_browser_front_tab_ref() — the only
     producer that validates them as digits.
     """
 
-    def __init__(self, target, window_id, tab_id, url):
+    def __init__(self, target, browser, window_id, tab_id, url):
         self.target = target
+        self.browser = browser
         self.window_id = window_id
         self.tab_id = tab_id
         self.url = url
 
     def block(self):
-        return park_tab(self.window_id, self.tab_id, self.target.label)
+        return park_tab(self.browser, self.window_id, self.tab_id, self.target.label)
 
     def restore(self):
-        restore_tab(self.window_id, self.tab_id, self.url, self.target.label)
+        restore_tab(self.browser, self.window_id, self.tab_id, self.url, self.target.label)
 
     def discard(self):
-        discard_parked_tab(self.window_id, self.tab_id, self.target.label)
+        discard_parked_tab(self.browser, self.window_id, self.tab_id, self.target.label)
 
 
 def handle_intercept(target, surface):
@@ -971,17 +1035,19 @@ def monitor():
                     refresh_last_seen(app_target.key)
                 last_app_key = app_target.key if app_target is not None else None
 
-                # Check 2: web-surface targets in Chrome (edge-triggered on tab URL)
-                if current_frontmost == CHROME_APP_NAME:
-                    chrome_url = get_chrome_active_tab_url()
-                    web_target = match_url(chrome_url, targets)
+                # Check 2: web-surface targets in a supported browser (edge-triggered on tab URL)
+                browser = BROWSERS_BY_APP_NAME.get(current_frontmost)
+                if browser is not None:
+                    tab_url = get_browser_active_tab_url(browser)
+                    web_target = match_url(tab_url, targets)
 
                     if web_target is not None and web_target.key != last_web_key:
-                        log(f"{web_target.label} tab activated: {_hostname_for_log(chrome_url)}")
-                        # Pin the exact tab so it can be restored into its own
-                        # profile. Ids come ONLY from get_chrome_front_tab_ref.
-                        window_id, tab_id = get_chrome_front_tab_ref()
-                        surface = WebSurface(web_target, window_id, tab_id, chrome_url)
+                        log(f"{web_target.label} tab activated: {_hostname_for_log(tab_url)}")
+                        # Pin the exact tab (or window, for a browser without
+                        # tab ids) so it can be restored into its own place.
+                        # Ids come ONLY from get_browser_front_tab_ref.
+                        window_id, tab_id = get_browser_front_tab_ref(browser)
+                        surface = WebSurface(web_target, browser, window_id, tab_id, tab_url)
                         allowed = handle_intercept(web_target, surface)
                         if not allowed:
                             # Reset edge keys so a missed target re-triggers on the

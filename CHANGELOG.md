@@ -4,7 +4,8 @@
 
 First public release.
 
-- Gates ten distraction targets on macOS: Slack and WhatsApp as native apps plus their web apps, and web-only Gmail, Instagram, Facebook, Reddit, YouTube, X, TikTok, LinkedIn (Chrome).
+- Gates ten distraction targets on macOS: Slack and WhatsApp as native apps plus their web apps, and web-only Gmail, Instagram, Facebook, Reddit, YouTube, X, TikTok, LinkedIn -- web gating works in both Chrome and Safari. Firefox isn't supported (no AppleScript tab-URL access).
+- One-click installer (`FokusKeeper-Install.command`, distributed via GitHub Releases): download, unzip, double-click, no git or terminal typing needed.
 - Blocking dialog with today's stats, "Stay focused" as the safe default, and "I have a reason" to proceed.
 - First-run native chooser to pick which targets to gate; re-run anytime with `fokuskeeper setup`; config changes apply live.
 - Per-target 3-minute cooldown shared between a target's app and web surfaces; first-open-of-the-day and 60-minute quiet-period auto-allows.

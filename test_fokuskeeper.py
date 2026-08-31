@@ -615,7 +615,8 @@ class TestWebSurfaceInjection(_TempStateMixin):
     def test_hostile_url_is_escaped_in_osascript_body(self):
         hostile_url = 'https://app.slack.com/x" & (do shell script "true") & "'
         target = sg.TARGETS_BY_KEY["slack"]
-        surface = sg.WebSurface(target, 123, 456, hostile_url)
+        chrome = sg.BROWSERS_BY_APP_NAME["Google Chrome"]
+        surface = sg.WebSurface(target, chrome, 123, 456, hostile_url)
 
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -630,15 +631,16 @@ class TestWebSurfaceInjection(_TempStateMixin):
         assert '"https://app.slack.com/x" & (do shell script' not in script
 
 
-class TestChromeTabRefValidation:
-    """Tab ids come only from get_chrome_front_tab_ref, which requires digits."""
+class TestBrowserTabRefValidation:
+    """Tab ids come only from get_browser_front_tab_ref, which requires digits."""
 
-    def _ref_for(self, stdout, returncode=0):
+    def _ref_for(self, stdout, returncode=0, browser=None):
         mock_result = MagicMock()
         mock_result.returncode = returncode
         mock_result.stdout = stdout
+        browser = browser or sg.BROWSERS_BY_APP_NAME["Google Chrome"]
         with patch.object(sg.subprocess, 'run', return_value=mock_result):
-            return sg.get_chrome_front_tab_ref()
+            return sg.get_browser_front_tab_ref(browser)
 
     def test_valid_ids_parse(self):
         assert self._ref_for("12|34\n") == (12, 34)
@@ -652,6 +654,58 @@ class TestChromeTabRefValidation:
         assert self._ref_for("") == (None, None)
         assert self._ref_for("12|34|56") == (None, None)
         assert self._ref_for("err: no window", returncode=1) == (None, None)
+
+    def test_safari_has_no_tab_id_only_window_id(self):
+        # Safari's dictionary has no per-tab id (has_tab_ids=False), so this
+        # path returns only a window id, with tab_id always None.
+        safari = sg.BROWSERS_BY_APP_NAME["Safari"]
+        assert self._ref_for("789\n", browser=safari) == (789, None)
+
+    def test_safari_non_numeric_window_id_rejected(self):
+        safari = sg.BROWSERS_BY_APP_NAME["Safari"]
+        assert self._ref_for("", browser=safari) == (None, None)
+        assert self._ref_for("abc", browser=safari) == (None, None)
+
+
+class TestParkTabSafariNoTabId:
+    """park_tab must succeed with tab_id=None (Safari) -- only window_id is required."""
+
+    def test_park_succeeds_with_window_id_only(self):
+        safari = sg.BROWSERS_BY_APP_NAME["Safari"]
+        mock_result = MagicMock(returncode=0, stdout="ok")
+        with patch.object(sg, '_run', return_value=mock_result), patch.object(sg, 'log'):
+            assert sg.park_tab(safari, 789, None, "WhatsApp") is True
+
+    def test_park_fails_cleanly_with_no_window_id(self):
+        safari = sg.BROWSERS_BY_APP_NAME["Safari"]
+        with patch.object(sg, 'log') as mock_log:
+            assert sg.park_tab(safari, None, None, "WhatsApp") is False
+        assert "Could not identify" in mock_log.call_args[0][0]
+
+
+class TestTellTabSafariNoTabId:
+    """_tell_tab's window-only path (tab_id=None) for a browser without tab ids."""
+
+    def test_targets_current_tab_of_window_by_id(self):
+        safari = sg.BROWSERS_BY_APP_NAME["Safari"]
+        mock_result = MagicMock(returncode=0, stdout="ok")
+        with patch.object(sg, '_run', return_value=mock_result) as mock_run:
+            assert sg._tell_tab(safari, 789, None, 'set URL of targetTab to "about:blank"') is True
+
+        script = mock_run.call_args[0][0][2]
+        assert "exists window id 789" in script
+        assert "tell window id 789" in script
+        assert "current tab" in script
+        # No tab-id repeat/matching loop -- that shape is Chrome-only.
+        assert "tabs of targetWindow" not in script
+
+    def test_failure_is_logged_with_browser_name(self):
+        safari = sg.BROWSERS_BY_APP_NAME["Safari"]
+        mock_result = MagicMock(returncode=0, stdout="err: window 789 not found")
+        with patch.object(sg, '_run', return_value=mock_result), \
+             patch.object(sg, 'log') as mock_log:
+            assert sg._tell_tab(safari, 789, None, "close targetTab") is False
+        assert mock_log.call_args[0][0] == "Safari tab operation failed (window 789, tab None): err: window 789 not found"
 
 
 class TestCliAllTargets(_TempCliMixin):
@@ -1175,14 +1229,28 @@ class TestAccessWarnings:
         assert mock_log.called is False
 
     def test_chrome_tabs_denied_warns_once(self):
+        chrome = sg.BROWSERS_BY_APP_NAME["Google Chrome"]
         with patch.object(sg, '_run', return_value=self._denied()), \
              patch.object(sg, 'log') as mock_log:
-            assert sg.get_chrome_active_tab_url() == ""
-            assert sg.get_chrome_active_tab_url() == ""
+            assert sg.get_browser_active_tab_url(chrome) == ""
+            assert sg.get_browser_active_tab_url(chrome) == ""
 
         warnings = [c for c in mock_log.call_args_list if "WARNING" in c.args[0]]
         assert len(warnings) == 1
         assert "chrome" in warnings[0].args[0].lower()
+
+    def test_safari_tabs_denied_warns_independently_of_chrome(self):
+        safari = sg.BROWSERS_BY_APP_NAME["Safari"]
+        chrome = sg.BROWSERS_BY_APP_NAME["Google Chrome"]
+        with patch.object(sg, '_run', return_value=self._denied()), \
+             patch.object(sg, 'log') as mock_log:
+            sg.get_browser_active_tab_url(chrome)
+            sg.get_browser_active_tab_url(safari)
+
+        warnings = [c.args[0] for c in mock_log.call_args_list if "WARNING" in c.args[0]]
+        assert len(warnings) == 2  # chrome_tabs and safari_tabs each warn once
+        assert any("Safari" in w for w in warnings)
+        assert any("Google Chrome" in w for w in warnings)
 
     def test_quit_app_denied_does_not_claim_success(self):
         with patch.object(sg, '_run', return_value=self._denied()), \
