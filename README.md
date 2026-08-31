@@ -15,6 +15,14 @@ Two buttons:
 
 That is the whole product. It is a speed bump, not a wall. Most distraction checks are reflexes; making the reflex cost one conscious decision is enough to kill a large share of them, and the dialog shows you the running score.
 
+## Download
+
+[**Download FokusKeeper**](https://github.com/cipshadow/fokuskeeper/releases/latest/download/FokusKeeper-Install.zip)
+
+Unzip it, then double-click `FokusKeeper-Install.command`. A Terminal window opens itself, downloads the app, and installs it -- no typing required. macOS may show a one-time security prompt since this isn't a signed app; if double-clicking doesn't open it, right-click the file and choose Open instead.
+
+Prefer git? See [Manual install](#install) below.
+
 ## Targets
 
 | Target | App | Web (Chrome) |
