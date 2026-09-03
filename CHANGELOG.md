@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0 - 2026-09-03
+
+- **Settings...** is now one native window: the app checklist and both timing fields together, Save/Cancel for the whole thing at once -- not three separate dialogs in a row.
+- Fixed a layout bug in that window where a label overlapped the example text below it.
+- Installs without the menu bar's `rumps`/AppKit dependency still work: `fokuskeeper settings` falls back to the previous three-dialog flow automatically.
+
 ## 1.2.0 - 2026-08-31
 
 - Renamed "targets" to "apps" throughout the UI, dialogs, and docs.

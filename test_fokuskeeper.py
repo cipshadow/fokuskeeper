@@ -4,6 +4,7 @@ Unit tests for FokusKeeper functionality.
 Focus on testing the new dialog logic without requiring macOS dependencies.
 """
 import os
+import sys
 import pytest
 from unittest.mock import patch, MagicMock
 import subprocess
@@ -1074,6 +1075,58 @@ class TestRunTimingSettings(_TempConfigMixin):
         assert json.loads(self.config_file.read_text()) == {
             "enabled": ["reddit"], "cooldown_minutes": 10, "quiet_period_minutes": 90,
         }
+
+
+class TestCmdSettings(_TempConfigMixin):
+    """cmd_settings(): the panel path and its headless (no AppKit) fallback."""
+
+    def _run_settings_with_panel(self, panel_return):
+        """panel_return: (result, enabled_keys, cooldown_text, quiet_text)."""
+        fake_module = MagicMock()
+        fake_module.show_settings_panel = MagicMock(return_value=panel_return)
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            with patch.dict(sys.modules, {"fokuskeeper_settings_panel": fake_module}):
+                sg.cmd_settings()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_save_writes_enabled_and_timing_together(self):
+        self._run_settings_with_panel(("save", ["reddit", "gmail"], "10", "90"))
+        assert json.loads(self.config_file.read_text()) == {
+            "enabled": ["reddit", "gmail"], "cooldown_minutes": 10, "quiet_period_minutes": 90,
+        }
+
+    def test_cancel_writes_nothing(self):
+        self._run_settings_with_panel(("cancel", ["reddit"], "10", "90"))
+        assert not self.config_file.exists()
+
+    def test_invalid_timing_text_falls_back_to_current_value(self):
+        self.config_file.write_text(json.dumps({"cooldown_minutes": 3, "quiet_period_minutes": 60}))
+        self._run_settings_with_panel(("save", ["slack"], "not a number", "90"))
+        assert json.loads(self.config_file.read_text()) == {
+            "enabled": ["slack"], "cooldown_minutes": 3, "quiet_period_minutes": 90,
+        }
+
+    def test_no_appkit_falls_back_to_sequential_dialogs(self):
+        # Simulate a headless install (see install.sh's MENUBAR_READY
+        # fallback): `import fokuskeeper_settings_panel` must raise
+        # ImportError, so cmd_settings falls back to the native dialogs
+        # instead of crashing.
+        patches = self._patches()
+        for p in patches:
+            p.start()
+        try:
+            with patch.dict(sys.modules, {"fokuskeeper_settings_panel": None}), \
+                 patch.object(sg, "_run_settings_sequential") as fallback:
+                sg.cmd_settings()
+            fallback.assert_called_once()
+        finally:
+            for p in patches:
+                p.stop()
 
 
 class _RecordingSurface:

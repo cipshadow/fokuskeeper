@@ -74,7 +74,7 @@ The installer checks for `python3`, sets up a menu bar icon (a small `.venv` wit
 
 If the menu bar setup can't complete (no network, or no build tools for one of its dependencies), install continues anyway with a plain headless daemon — no menu bar icon, but gating still works fully. Retry the menu bar setup any time with `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && ./start-menubar.sh`, then re-run `./install.sh` to regenerate the login launcher so it picks it up automatically.
 
-On first run a short welcome screen explains how the dialog and cooldown work, then a native chooser lists all ten apps, pre-selected (deselect any you want ungated), followed by two prompts for the cooldown and quiet-period minutes. Your choices are saved to `~/.fokuskeeper-config.json`. Change any of it again any time from the menu bar icon's **Settings...** menu item.
+On first run a short welcome screen explains how the dialog and cooldown work, then a native chooser lists all ten apps, pre-selected (deselect any you want ungated), followed by the Settings window for cooldown and quiet-period minutes. Your choices are saved to `~/.fokuskeeper-config.json`. Change any of it again any time from the menu bar icon's **Settings...** menu item.
 
 ### Permissions
 
@@ -110,7 +110,7 @@ FokusKeeper - Today's stats (2026-08-30)
 
 ## Customization
 
-- **Apps and timing**: click **Settings...** in the menu bar icon's menu, or run `./fokuskeeper settings` from a terminal -- both walk through the same three prompts: which apps to gate, cooldown minutes, and quiet-period minutes (1-1440 each), pre-filled with your current values. Cancelling the app chooser just skips that step; cancelling either timing prompt skips both timing settings together, leaving your existing cooldown/quiet-period values as they were. Changes apply live; the daemon watches the config file's mtime, no restart needed.
+- **Apps and timing**: click **Settings...** in the menu bar icon's menu, or run `./fokuskeeper settings` from a terminal -- both open one window with the app checklist and both timing fields (cooldown and quiet-period minutes, 1-1440 each) together, pre-filled with your current values. Save writes everything at once; Cancel leaves your existing settings untouched. Changes apply live; the daemon watches the config file's mtime, no restart needed. (A headless install without the menu bar's `rumps`/AppKit dependency falls back to three separate native dialogs instead -- same settings, same result.)
 - **Menu bar icon**: installed by default (see Install above). A shield-with-K icon shows daemon state; click it to start/stop. To start it manually without logging out and back in, run `./start-menubar.sh` — it prefers the repo's `.venv` automatically and starts the daemon itself if it isn't already running.
 
 ## Uninstall
