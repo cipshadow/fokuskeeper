@@ -128,8 +128,8 @@ class SettingsPanel:
 
         # Quiet period section
         self.quiet_field, views, height = self._timer_field(
-            "Quiet period (minutes): how rarely you can check an app before "
-            "it stops counting as a distraction.",
+            "Quiet period (minutes): how often you can check an app without "
+            "it counting as a distraction.",
             "Example: 60 minutes means checking Slack once an hour is fine "
             "and won't be gated -- but coming back sooner will be.",
             quiet_period_minutes, y, content_width,
