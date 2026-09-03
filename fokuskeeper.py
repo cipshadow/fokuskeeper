@@ -1399,14 +1399,46 @@ def run_timing_settings():
     return (new_cooldown, new_quiet)
 
 
-def cmd_settings():
-    """`fokuskeeper settings`: one combined flow -- choose apps, then set the
-    cooldown and quiet-period minutes. Each step keeps its own cancel
-    semantics (see run_setup and run_timing_settings); this just presents
-    them back-to-back as a single settings visit instead of two commands.
+def _run_settings_sequential():
+    """Fallback for installs without AppKit (see cmd_settings): the same
+    three settings, as separate native dialogs instead of one window.
     """
     run_setup()
     run_timing_settings()
+
+
+def cmd_settings():
+    """`fokuskeeper settings`: one native window with the app checklist and
+    both timing fields together. Falls back to three separate dialogs
+    (the app chooser, then the two timing prompts) on a headless install
+    that skipped the menu bar's rumps/AppKit dependency -- see
+    install.sh's "MENUBAR_READY" fallback path. Either way, config is
+    written through the same _read_raw_config/save_config merge, so the
+    two paths stay behaviorally identical from CONFIG_FILE's perspective.
+    """
+    try:
+        from fokuskeeper_settings_panel import show_settings_panel
+    except ImportError:
+        _run_settings_sequential()
+    else:
+        result, new_enabled, cooldown_text, quiet_text = show_settings_panel(
+            TARGETS, [t.key for t in enabled_targets()],
+            cooldown_minutes(), quiet_period_minutes(),
+        )
+        if result != "save":
+            log("Settings panel cancelled - config left untouched")
+        else:
+            config = _read_raw_config()
+            config["enabled"] = new_enabled
+            config["cooldown_minutes"] = _positive_int_or(cooldown_text, cooldown_minutes())
+            config["quiet_period_minutes"] = _positive_int_or(quiet_text, quiet_period_minutes())
+            save_config(config)
+            log(
+                f"Settings saved: enabled apps = {', '.join(new_enabled) or 'none'}, "
+                f"cooldown={config['cooldown_minutes']}min, "
+                f"quiet_period={config['quiet_period_minutes']}min"
+            )
+
     labels = ", ".join(t.label for t in enabled_targets())
     print(f"Enabled apps: {labels}")
     print(f"Cooldown: {cooldown_minutes()} minutes. Quiet period: {quiet_period_minutes()} minutes.")
