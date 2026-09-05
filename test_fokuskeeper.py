@@ -1543,6 +1543,135 @@ class TestAccessWarnings:
         assert len(warnings) == 3  # frontmost, quit:Slack, quit:WhatsApp each fire once
 
 
+def _ev(date, time_str, event_type):
+    return {"date": date, "time": time_str, "type": event_type}
+
+
+class TestDaemonUptimeIntervals:
+    """_daemon_uptime_intervals(): pairs daemon_start/daemon_stop events."""
+
+    def test_pairs_start_and_stop(self):
+        history = [_ev("2026-09-01", "09:00:00", "daemon_start"),
+                   _ev("2026-09-01", "17:00:00", "daemon_stop")]
+        intervals = sg._daemon_uptime_intervals(history)
+        assert intervals == [(datetime(2026, 9, 1, 9, 0, 0), datetime(2026, 9, 1, 17, 0, 0))]
+
+    def test_unmatched_trailing_start_closes_at_now(self):
+        history = [_ev("2026-09-01", "09:00:00", "daemon_start")]
+        before = datetime.now()
+        intervals = sg._daemon_uptime_intervals(history)
+        assert len(intervals) == 1
+        assert intervals[0][0] == datetime(2026, 9, 1, 9, 0, 0)
+        assert before <= intervals[0][1] <= datetime.now()
+
+    def test_duplicate_start_before_stop_keeps_earlier_start(self):
+        # A crash that skipped the SIGTERM handler, then a restart, before
+        # any stop was ever recorded -- must not fabricate a second interval.
+        history = [_ev("2026-09-01", "09:00:00", "daemon_start"),
+                    _ev("2026-09-01", "09:05:00", "daemon_start"),
+                    _ev("2026-09-01", "17:00:00", "daemon_stop")]
+        intervals = sg._daemon_uptime_intervals(history)
+        assert intervals == [(datetime(2026, 9, 1, 9, 0, 0), datetime(2026, 9, 1, 17, 0, 0))]
+
+    def test_non_daemon_events_ignored(self):
+        history = [_ev("2026-09-01", "09:00:00", "gmail_opened")]
+        assert sg._daemon_uptime_intervals(history) == []
+
+
+class TestDaemonActiveMinutesByDate:
+    """_daemon_active_minutes_by_date(): per-day overlap with uptime intervals."""
+
+    def test_full_day_coverage(self):
+        history = [_ev("2026-09-01", "00:00:00", "daemon_start"),
+                   _ev("2026-09-02", "00:00:00", "daemon_stop")]
+        minutes = sg._daemon_active_minutes_by_date(history, ["2026-09-01"])
+        assert minutes["2026-09-01"] == pytest.approx(24 * 60)
+
+    def test_interval_spanning_midnight_splits_across_two_days(self):
+        history = [_ev("2026-09-01", "23:00:00", "daemon_start"),
+                   _ev("2026-09-02", "01:00:00", "daemon_stop")]
+        minutes = sg._daemon_active_minutes_by_date(history, ["2026-09-01", "2026-09-02"])
+        assert minutes["2026-09-01"] == pytest.approx(60)
+        assert minutes["2026-09-02"] == pytest.approx(60)
+
+    def test_no_events_gives_zero(self):
+        minutes = sg._daemon_active_minutes_by_date([], ["2026-09-01"])
+        assert minutes["2026-09-01"] == 0.0
+
+
+class TestFormatCoverage:
+    """_format_coverage(): disambiguates "off" from "predates this feature"."""
+
+    def test_active_minutes_under_an_hour(self):
+        assert sg._format_coverage(5, False, True) == "daemon active ~5m"
+
+    def test_active_minutes_over_an_hour(self):
+        assert sg._format_coverage(90, False, True) == "daemon active ~1h30m"
+
+    def test_zero_minutes_with_no_activity_and_feature_data_reads_as_off(self):
+        assert sg._format_coverage(0, False, True) == "daemon appears to have been off all day"
+
+    def test_zero_minutes_but_real_activity_recorded_does_not_claim_off(self):
+        # A day with recorded opens/blocks proves the daemon WAS running --
+        # zero tracked minutes here just means it predates this feature.
+        note = sg._format_coverage(0, True, True)
+        assert "off" not in note
+        assert "before this feature" in note
+
+    def test_zero_minutes_and_no_feature_data_anywhere_reads_as_unknown(self):
+        note = sg._format_coverage(0, False, False)
+        assert "unknown" in note
+
+
+class TestCmdHistoryCoverage(_TempStateMixin):
+    """cmd_history(): the per-day coverage note end to end.
+
+    Dates are relative to today (not hardcoded) so these stay inside
+    cmd_history's rolling 6-day window no matter when the suite runs.
+    """
+
+    def setup_method(self):
+        super().setup_method()
+        self.today = datetime.now().strftime("%Y-%m-%d")
+        self.yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def _history(self, events):
+        self.history_file.write_text(json.dumps(events))
+
+    def test_quiet_day_with_daemon_on_shows_active_not_off(self, capsys):
+        self._history([
+            _ev(self.today, "09:00:00", "daemon_start"),
+            _ev(self.today, "17:00:00", "daemon_stop"),
+        ])
+        with patch.object(sg, 'HISTORY_FILE', self.history_file):
+            sg.cmd_history()
+        out = capsys.readouterr().out
+        assert self.today in out
+        assert "daemon active ~8h00m" in out
+        assert "opens 0" in out  # zero opens, still shown, not omitted
+
+    def test_day_with_no_daemon_events_but_real_opens_does_not_say_off(self, capsys):
+        self._history([_ev(self.today, "10:00:00", "gmail_opened")])
+        with patch.object(sg, 'HISTORY_FILE', self.history_file):
+            sg.cmd_history()
+        out = capsys.readouterr().out
+        line = [l for l in out.splitlines() if self.today in l][0]
+        assert "off all day" not in line
+        assert "before this feature" in line
+
+    def test_day_with_daemon_off_and_zero_activity_says_off(self, capsys):
+        self._history([
+            _ev(self.yesterday, "09:00:00", "daemon_start"),
+            _ev(self.yesterday, "10:00:00", "daemon_stop"),
+            _ev(self.today, "10:00:00", "gmail_opened"),  # gives the feature SOME data elsewhere
+        ])
+        with patch.object(sg, 'HISTORY_FILE', self.history_file):
+            sg.cmd_history()
+        out = capsys.readouterr().out
+        line = [l for l in out.splitlines() if self.today in l][0]
+        assert "before this feature" in line  # opens recorded that day, zero tracked minutes
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

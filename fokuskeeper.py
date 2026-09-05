@@ -5,6 +5,8 @@ FokusKeeper - Prevents mindless distraction checking by requiring intentional pu
 import argparse
 import os
 import shutil
+import signal
+import sys
 import time
 import subprocess
 import json
@@ -1004,10 +1006,22 @@ def allow_access(app_type="slack"):
     save_state(state)
     log(f"Access allowed - {app_type} cooldown started ({cooldown_minutes()} min)")
 
+def _log_daemon_stop_and_exit(_signum, _frame):
+    """SIGTERM handler: `fokuskeeper stop` uses pkill, not Ctrl+C, so without
+    this, every normal stop would be invisible to cmd_history()'s coverage
+    calculation -- it would only ever see "daemon_start" events and assume
+    the daemon ran forever.
+    """
+    save_to_history("daemon_stop")
+    sys.exit(0)
+
+
 def monitor():
     """Main monitoring loop across all enabled targets (app + web surfaces)."""
+    signal.signal(signal.SIGTERM, _log_daemon_stop_and_exit)
     targets = enabled_targets()
     log(f"FokusKeeper started ({', '.join(t.label for t in targets)})")
+    save_to_history("daemon_start")
 
     # Display helpful startup information
     print("=" * 70)
@@ -1122,6 +1136,7 @@ def monitor():
 
     except KeyboardInterrupt:
         log("FokusKeeper stopped")
+        save_to_history("daemon_stop")
         summary = ", ".join(
             f"{t.label}: {get_daily_count(t.key)}" for t in enabled_targets()
             if get_daily_count(t.key)
@@ -1212,32 +1227,119 @@ def _bucket_event_type(event_type):
                 return (key, kind)
     return None
 
+def _daemon_uptime_intervals(history):
+    """(start_dt, stop_dt) pairs from daemon_start/daemon_stop events, in
+    chronological order. A trailing unmatched start (the common case: the
+    daemon is still running right now) closes at datetime.now().
+    """
+    events = []
+    for event in history:
+        kind = event.get("type")
+        if kind not in ("daemon_start", "daemon_stop"):
+            continue
+        try:
+            ts = datetime.strptime(f"{event['date']} {event['time']}", "%Y-%m-%d %H:%M:%S")
+        except (KeyError, ValueError):
+            continue
+        events.append((ts, kind))
+    events.sort(key=lambda pair: pair[0])
+
+    intervals = []
+    open_start = None
+    for ts, kind in events:
+        if kind == "daemon_start":
+            if open_start is None:
+                open_start = ts
+            # A second daemon_start before any stop is unusual (e.g. a crash
+            # that skipped the SIGTERM handler) -- keep the earlier start.
+        elif open_start is not None:
+            intervals.append((open_start, ts))
+            open_start = None
+    if open_start is not None:
+        intervals.append((open_start, datetime.now()))
+    return intervals
+
+
+def _daemon_active_minutes_by_date(history, dates):
+    """{date: minutes the daemon is known to have been running that day}.
+
+    Coarse by design: it answers "was FokusKeeper even on," not a precise
+    time log. Overlapping/duplicate start events collapse to one interval,
+    so a crash-and-restart still reads as continuous coverage.
+    """
+    intervals = _daemon_uptime_intervals(history)
+    minutes_by_date = {}
+    for date_str in dates:
+        day_start = datetime.strptime(date_str, "%Y-%m-%d")
+        day_end = day_start + timedelta(days=1)
+        minutes = 0.0
+        for start, stop in intervals:
+            overlap_start = max(start, day_start)
+            overlap_end = min(stop, day_end)
+            if overlap_end > overlap_start:
+                minutes += (overlap_end - overlap_start).total_seconds() / 60
+        minutes_by_date[date_str] = minutes
+    return minutes_by_date
+
+
+def _format_coverage(minutes, has_recorded_activity, feature_has_any_data):
+    """minutes==0 is ambiguous on its own: it might mean the daemon was
+    really off, or it might mean this day predates daemon_start/daemon_stop
+    tracking entirely (added after 1.3.0) -- in which case saying "off all
+    day" would flatly contradict a day that has real opens/blocks recorded.
+    The other two args disambiguate those cases.
+    """
+    if minutes > 0:
+        hours, mins = divmod(round(minutes), 60)
+        if hours == 0:
+            return f"daemon active ~{mins}m"
+        return f"daemon active ~{hours}h{mins:02d}m"
+    if has_recorded_activity:
+        return "coverage not tracked (recorded before this feature)"
+    if not feature_has_any_data:
+        return "coverage unknown (daemon hasn't restarted since this update)"
+    return "daemon appears to have been off all day"
+
+
 def cmd_history():
-    """Print the last 7 days of activity grouped by date."""
+    """Print the last 7 days of activity grouped by date, with a coverage
+    note per day so a quiet day can be told apart from an offline one.
+    """
     history = load_history()
     cutoff = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
     days = {}
     for event in history:
         date = event.get("date", "")
-        if date < cutoff:
+        if date < cutoff or not date:
             continue
+        # Seed every day that has ANY recorded event, not just target opens/
+        # blocks -- a day the daemon ran with zero opens must still show up
+        # (as all-zero counts, not silently missing), or it's indistinguishable
+        # from a day FokusKeeper simply wasn't running at all.
+        days.setdefault(date, {k: {"opened": 0, "prevented": 0} for k in TARGET_KEYS})
         bucket = _bucket_event_type(event.get("type"))
-        if bucket is None:
-            continue
-        key, kind = bucket
-        day = days.setdefault(date, {k: {"opened": 0, "prevented": 0} for k in TARGET_KEYS})
-        day[key][kind] += 1
+        if bucket is not None:
+            key, kind = bucket
+            days[date][key][kind] += 1
 
     print("FokusKeeper - Last 7 days")
     if not days:
         print("  No activity recorded.")
         return
+    coverage = _daemon_active_minutes_by_date(history, days.keys())
+    feature_has_any_data = any(
+        event.get("type") in ("daemon_start", "daemon_stop") for event in history
+    )
     for date in sorted(days):
         parts = [
             f"{TARGET_LABELS[key]} opens {days[date][key]['opened']}, blocked {days[date][key]['prevented']}"
             for key in TARGET_KEYS
         ]
-        print(f"  {date}: " + " | ".join(parts))
+        has_activity = any(
+            days[date][key][kind] for key in TARGET_KEYS for kind in ("opened", "prevented")
+        )
+        note = _format_coverage(coverage[date], has_activity, feature_has_any_data)
+        print(f"  {date} ({note}): " + " | ".join(parts))
 
 def cmd_report():
     """Print totals across all recorded history."""
