@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0 - 2026-09-10
+
+- **Time saved model**: `fokuskeeper timesaved` prints modeled minutes saved for the last 7 days and all time, per app, with the block/reasoned/auto-allowed counts next to the net figure so the arithmetic stays visible. Blocks credit 10 min, reasoned opens debit 1 min, auto-allows count for nothing; all three multipliers and the workday length are overridable in `~/.fokuskeeper-config.json`. The dialog's "Time Rescued" line uses the same multiplier.
+- **Weekly summary notification**: every Friday at 16:00 the daemon posts a macOS notification with that week's blocked / reasoned / auto counts and net time saved. Fires on the first check at or after 16:00 (so a sleeping Mac gets it on wake), once per week across restarts.
+- History `*_opened` events now record why the open was allowed (`auto_first_of_day`, `auto_quiet_period`, `reasoned`), so reports classify decisions exactly instead of reconstructing them from timestamps. Older events fall back to the timing heuristic.
+
 ## 1.3.0 - 2026-09-03
 
 - **Settings...** is now one native window: the app checklist and both timing fields together, Save/Cancel for the whole thing at once -- not three separate dialogs in a row.

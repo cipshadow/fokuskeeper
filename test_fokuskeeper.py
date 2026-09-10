@@ -1675,3 +1675,288 @@ class TestCmdHistoryCoverage(_TempStateMixin):
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
+
+
+# ============================================================================
+# Time-saved model + weekly summary
+# ============================================================================
+
+MODEL = {"minutes_saved_per_block": 10, "minutes_cost_per_reasoned_open": 1, "workday_hours": 8}
+
+
+def _ev_r(date, time_str, event_type, reason=None):
+    event = _ev(date, time_str, event_type)
+    if reason is not None:
+        event["reason"] = reason
+    return event
+
+
+class TestClassifyHistory:
+    def test_prevented_is_always_stay_focused(self):
+        rows = sg.classify_history([_ev("2026-09-01", "09:00:00", "gmail_prevented")], 60)
+        assert [r["cls"] for r in rows] == [sg.CLASS_STAY_FOCUSED]
+
+    def test_recorded_reason_wins_over_timing(self):
+        # Timing alone would say first-of-day; the recorded reason says reasoned.
+        rows = sg.classify_history(
+            [_ev_r("2026-09-01", "09:00:00", "gmail_opened", sg.REASON_REASONED)], 60)
+        assert rows[0]["cls"] == sg.CLASS_REASONED
+
+    def test_unknown_reason_falls_back_to_timing(self):
+        rows = sg.classify_history(
+            [_ev_r("2026-09-01", "09:00:00", "gmail_opened", "garbage")], 60)
+        assert rows[0]["cls"] == sg.CLASS_AUTO_FIRST_OF_DAY
+
+    def test_timing_reconstruction_per_target(self):
+        history = [
+            _ev("2026-09-01", "09:00:00", "gmail_opened"),     # first of day
+            _ev("2026-09-01", "09:10:00", "gmail_opened"),     # 10 min gap -> reasoned
+            _ev("2026-09-01", "10:10:00", "gmail_opened"),     # exactly 60 -> quiet
+            _ev("2026-09-01", "10:15:00", "whatsapp_opened"),  # other target: first of day
+            _ev("2026-09-02", "08:00:00", "gmail_opened"),     # new day -> first of day
+        ]
+        rows = sg.classify_history(history, 60)
+        assert [r["cls"] for r in rows] == [
+            sg.CLASS_AUTO_FIRST_OF_DAY, sg.CLASS_REASONED, sg.CLASS_AUTO_QUIET_PERIOD,
+            sg.CLASS_AUTO_FIRST_OF_DAY, sg.CLASS_AUTO_FIRST_OF_DAY,
+        ]
+
+    def test_legacy_bare_types_count_as_slack(self):
+        rows = sg.classify_history([_ev("2026-09-01", "09:00:00", "opened"),
+                                    _ev("2026-09-01", "09:01:00", "prevented")], 60)
+        assert [(r["target"], r["cls"]) for r in rows] == [
+            ("slack", sg.CLASS_AUTO_FIRST_OF_DAY), ("slack", sg.CLASS_STAY_FOCUSED)]
+
+    def test_daemon_and_malformed_events_are_skipped(self):
+        history = [_ev("2026-09-01", "09:00:00", "daemon_start"),
+                   {"type": "gmail_opened"}, {"date": "bad", "time": "x", "type": "gmail_opened"}]
+        assert sg.classify_history(history, 60) == []
+
+    def test_out_of_order_input_is_sorted(self):
+        history = [_ev("2026-09-01", "09:10:00", "gmail_opened"),
+                   _ev("2026-09-01", "09:00:00", "gmail_opened")]
+        rows = sg.classify_history(history, 60)
+        assert [r["cls"] for r in rows] == [sg.CLASS_AUTO_FIRST_OF_DAY, sg.CLASS_REASONED]
+
+
+class TestSummarizeTimeSaved:
+    def _classified(self):
+        return sg.classify_history([
+            _ev_r("2026-09-01", "09:00:00", "gmail_opened", sg.REASON_FIRST_OF_DAY),
+            _ev_r("2026-09-01", "09:05:00", "gmail_opened", sg.REASON_REASONED),
+            _ev("2026-09-01", "09:10:00", "gmail_prevented"),
+            _ev("2026-09-01", "09:15:00", "whatsapp_prevented"),
+            _ev_r("2026-09-03", "11:00:00", "whatsapp_opened", sg.REASON_QUIET_PERIOD),
+        ], 60)
+
+    def test_arithmetic(self):
+        s = sg.summarize_time_saved(self._classified(), MODEL)
+        assert (s["attempts"], s["blocked"], s["reasoned"], s["auto_allowed"]) == (5, 2, 1, 2)
+        assert (s["minutes_saved"], s["minutes_cost"], s["net_minutes"]) == (20, 1, 19)
+        assert s["block_rate"] == pytest.approx(2 / 3)
+        assert s["net_workdays"] == pytest.approx(19 / 60 / 8)
+        assert s["active_days"] == 2
+        assert s["per_target"]["gmail"][sg.CLASS_REASONED] == 1
+
+    def test_window_is_half_open(self):
+        start = datetime(2026, 9, 1, 9, 5)
+        end = datetime(2026, 9, 1, 9, 15)
+        s = sg.summarize_time_saved(self._classified(), MODEL, start=start, end=end)
+        assert s["attempts"] == 2  # 09:05 in, 09:15 out
+        assert s["blocked"] == 1
+
+    def test_empty_window(self):
+        s = sg.summarize_time_saved([], MODEL)
+        assert s["attempts"] == 0 and s["block_rate"] is None and s["net_minutes"] == 0
+
+    def test_multipliers_change_the_answer(self):
+        model = dict(MODEL, minutes_saved_per_block=5, minutes_cost_per_reasoned_open=3)
+        s = sg.summarize_time_saved(self._classified(), model)
+        assert s["net_minutes"] == 2 * 5 - 1 * 3
+
+
+class TestFormatTimeSaved:
+    def test_format_minutes(self):
+        assert sg.format_minutes(0) == "0m"
+        assert sg.format_minutes(59) == "59m"
+        assert sg.format_minutes(163) == "2h 43m"
+        assert sg.format_minutes(-5) == "-5m"
+        assert sg.format_minutes(-125) == "-2h 05m"
+
+    def test_summary_text_keeps_block_count_next_to_net(self):
+        s = sg.summarize_time_saved(sg.classify_history([
+            _ev("2026-09-01", "09:10:00", "gmail_prevented")], 60), MODEL)
+        text = sg.format_time_saved_summary(s, MODEL, "Window:")
+        assert "Saved 10m (1 x 10 min) - cost 0m (0 x 1 min) = net 10m" in text
+        assert "Gmail: blocked 1" in text
+
+    def test_summary_text_empty(self):
+        text = sg.format_time_saved_summary(sg.summarize_time_saved([], MODEL), MODEL, "W:")
+        assert "No attempts recorded" in text
+
+    def test_weekly_text(self):
+        s = sg.summarize_time_saved(sg.classify_history([
+            _ev("2026-09-01", "09:10:00", "gmail_prevented"),
+            _ev_r("2026-09-01", "09:20:00", "gmail_opened", sg.REASON_REASONED)], 60), MODEL)
+        assert sg.weekly_summary_text(s, MODEL) == \
+            "1 blocked, 1 reasoned, 0 auto - net ~9m saved (model: 10 min/block)"
+        assert sg.weekly_summary_text(sg.summarize_time_saved([], MODEL), MODEL) == \
+            "No attempts recorded this week."
+
+
+class TestTimeSavedModelConfig(_TempConfigMixin):
+    def test_defaults_when_config_absent(self):
+        with patch.object(sg, "CONFIG_FILE", self.config_file):
+            assert sg.time_saved_model() == MODEL
+
+    def test_reads_overrides_and_rejects_bad_values(self):
+        self.config_file.write_text(json.dumps({
+            "minutes_saved_per_block": 15,
+            "minutes_cost_per_reasoned_open": "nope",
+            "workday_hours": 48,  # over the 24h cap -> default
+        }))
+        with patch.object(sg, "CONFIG_FILE", self.config_file):
+            assert sg.time_saved_model() == {
+                "minutes_saved_per_block": 15,
+                "minutes_cost_per_reasoned_open": 1,
+                "workday_hours": 8,
+            }
+
+    def test_dialog_time_rescued_uses_configured_multiplier(self):
+        assert sg.format_time_rescued(3, 15) == "45m"
+        assert sg.format_time_rescued(3) == "30m"
+
+
+class TestWeeklySummaryDue:
+    def test_friday_after_four_is_today(self):
+        now = datetime(2026, 9, 11, 16, 0)  # a Friday
+        assert sg.weekly_summary_due_at(now) == datetime(2026, 9, 11, 16, 0)
+
+    def test_friday_before_four_is_last_week(self):
+        now = datetime(2026, 9, 11, 15, 59)
+        assert sg.weekly_summary_due_at(now) == datetime(2026, 9, 4, 16, 0)
+
+    def test_midweek_points_at_previous_friday(self):
+        now = datetime(2026, 9, 9, 10, 0)  # Wednesday
+        assert sg.weekly_summary_due_at(now) == datetime(2026, 9, 4, 16, 0)
+
+    def test_saturday_points_at_yesterday(self):
+        now = datetime(2026, 9, 12, 9, 0)
+        assert sg.weekly_summary_due_at(now) == datetime(2026, 9, 11, 16, 0)
+
+
+class _HermeticStateMixin(_TempStateMixin):
+    """_TempStateMixin whose patches are active for the whole test, plus a
+    config path that doesn't exist, so nothing reads this machine's files."""
+
+    def setup_method(self):
+        super().setup_method()
+        self._active = self._patches() + [
+            patch.object(sg, 'CONFIG_FILE', self.temp_dir / "no-config.json"),
+        ]
+        for p in self._active:
+            p.start()
+
+    def teardown_method(self):
+        for p in self._active:
+            p.stop()
+        super().teardown_method()
+
+
+class TestMaybeSendWeeklySummary(_HermeticStateMixin):
+    """Fires once per due moment; catches up after a missed 16:00; records
+    the attempt even when the notification itself fails."""
+
+    def _history(self):
+        return [
+            _ev("2026-09-08", "09:10:00", "gmail_prevented"),   # inside the week
+            _ev("2026-09-01", "09:10:00", "gmail_prevented"),   # 10 days before due: outside
+            _ev("2026-09-11", "16:30:00", "gmail_prevented"),   # after due: outside
+        ]
+
+    def _run(self, now, notify_ok=True):
+        with patch.object(sg, "load_history", return_value=self._history()), \
+             patch.object(sg, "quiet_period_minutes", return_value=60), \
+             patch.object(sg, "time_saved_model", return_value=MODEL), \
+             patch.object(sg, "show_notification", return_value=notify_ok) as notify, \
+             patch.object(sg, "log"):
+            sent = sg.maybe_send_weekly_summary(now=now)
+        return sent, notify
+
+    def test_sends_once_for_the_week_window(self):
+        sent, notify = self._run(datetime(2026, 9, 11, 16, 0, 30))
+        assert sent is True
+        title, subtitle, body = notify.call_args[0]
+        assert title == "FokusKeeper"
+        assert subtitle == "Week ending Fri 11 Sep"
+        assert body.startswith("1 blocked, 0 reasoned, 0 auto - net ~10m")
+        assert sg.load_state()["weekly_summary_sent_for"] == "2026-09-11T16:00"
+
+    def test_second_check_same_week_is_a_noop(self):
+        self._run(datetime(2026, 9, 11, 16, 0, 30))
+        sent, notify = self._run(datetime(2026, 9, 12, 9, 0))
+        assert sent is False and not notify.called
+
+    def test_catches_up_when_daemon_was_off_at_four(self):
+        sent, notify = self._run(datetime(2026, 9, 13, 20, 0))  # Sunday evening
+        assert sent is True
+        assert notify.call_args[0][1] == "Week ending Fri 11 Sep"
+
+    def test_next_friday_fires_again(self):
+        self._run(datetime(2026, 9, 11, 16, 0, 30))
+        sent, _ = self._run(datetime(2026, 9, 18, 16, 0, 30))
+        assert sent is True
+        assert sg.load_state()["weekly_summary_sent_for"] == "2026-09-18T16:00"
+
+    def test_failed_notification_is_not_retried_all_week(self):
+        sent, _ = self._run(datetime(2026, 9, 11, 16, 0, 30), notify_ok=False)
+        assert sent is False
+        sent, notify = self._run(datetime(2026, 9, 11, 16, 1, 30))
+        assert sent is False and not notify.called
+
+    def test_preserves_other_state_keys(self):
+        sg.save_state({"gmail_opens": 3, "stats_date": "2026-09-11"})
+        self._run(datetime(2026, 9, 11, 16, 0, 30))
+        state = sg.load_state()
+        assert state["gmail_opens"] == 3 and "weekly_summary_sent_for" in state
+
+
+class TestOpenReasonLogging(_HermeticStateMixin):
+    """Every auto-allow / reasoned open writes its reason to history."""
+
+    def _history(self):
+        return json.loads(self.history_file.read_text())
+
+    def test_first_open_of_day_logs_reason(self):
+        target = sg.TARGETS_BY_KEY["gmail"]
+        with patch.object(sg, "log"), patch.object(sg, "allow_access"):
+            sg.handle_intercept(target, _RecordingSurface())
+        assert self._history()[-1]["reason"] == sg.REASON_FIRST_OF_DAY
+
+    def test_reasoned_open_logs_reason(self):
+        target = sg.TARGETS_BY_KEY["gmail"]
+        with patch.object(sg, "log"), patch.object(sg, "allow_access"), \
+             patch.object(sg, "evaluate_gate", return_value=sg.Gate.PROMPT), \
+             patch.object(sg, "show_confirmation_dialog", return_value=True), \
+             patch.object(sg.time, "sleep"):
+            sg.handle_intercept(target, _RecordingSurface())
+        assert self._history()[-1]["reason"] == sg.REASON_REASONED
+
+    def test_quiet_period_open_logs_reason(self):
+        target = sg.TARGETS_BY_KEY["gmail"]
+        with patch.object(sg, "log"), patch.object(sg, "allow_access"), \
+             patch.object(sg, "evaluate_gate", return_value=sg.Gate.QUIET):
+            sg.handle_intercept(target, _RecordingSurface())
+        assert self._history()[-1]["reason"] == sg.REASON_QUIET_PERIOD
+
+    def test_prevented_has_no_reason_field(self):
+        sg.increment_prevented_count("gmail")
+        assert "reason" not in self._history()[-1]
+
+
+class TestTimesavedCommand(_TempCliMixin):
+    def test_runs_with_no_history(self, capsys):
+        self._run_main(["timesaved"])
+        out = capsys.readouterr().out
+        assert "Time saved (modeled, not measured)" in out
+        assert out.count("No attempts recorded") == 2

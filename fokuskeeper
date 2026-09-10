@@ -42,6 +42,7 @@ usage() {
     echo "  stats     - Today's statistics"
     echo "  history   - Last 7 days"
     echo "  report    - Comprehensive all-time report"
+    echo "  timesaved - Modeled time saved: last 7 days and all time"
     echo "  reset     - Reset today's counts"
     echo "  settings  - Choose apps and adjust cooldown/quiet-period minutes"
 }
@@ -89,7 +90,7 @@ case "$1" in
         echo ""
         echo "Daemon stdout log: $STDOUT_LOG"
         ;;
-    stats|history|report|reset|settings)
+    stats|history|report|timesaved|reset|settings)
         exec "$PY" "$DIR/fokuskeeper.py" "$1"
         ;;
     *)
