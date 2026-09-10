@@ -93,6 +93,7 @@ Grants are **per launching app**: the daemon started from your terminal and the 
 ./fokuskeeper stats      # today's per-app numbers
 ./fokuskeeper history    # last 7 days, grouped by date
 ./fokuskeeper report     # all-time totals
+./fokuskeeper timesaved  # modeled time saved: last 7 days and all time
 ./fokuskeeper reset      # zero today's counters (cooldowns survive)
 ./fokuskeeper settings   # choose apps, adjust cooldown / quiet-period minutes
 ```
@@ -107,6 +108,25 @@ FokusKeeper - Today's stats (2026-08-30)
   Total opens: 4
   Total blocked: 2
 ```
+
+## Time saved
+
+`./fokuskeeper timesaved` and the dialog's "Time Rescued" line use the same model, and every Friday at 16:00 the daemon posts a macOS notification with that week's figure. It is a model under stated assumptions, not measured time:
+
+- each **blocked** distraction ("Stay focused") is credited 10 minutes;
+- each **reasoned** open ("I have a reason") is debited 1 minute for the dialog;
+- **auto-allowed** opens (first of the day, quiet period) count for nothing either way, since no dialog was shown and no decision was made;
+- net minutes = blocks × 10 − reasoned × 1. At that ratio the number tracks your block count almost one-to-one, which is why the output always prints the counts next to it.
+
+Deterrence isn't recorded (opens that never happened because the gate exists leave no trace), so treat it as a lower bound of the model, not a measurement. All three multipliers are overridable in `~/.fokuskeeper-config.json`:
+
+```json
+{ "minutes_saved_per_block": 10, "minutes_cost_per_reasoned_open": 1, "workday_hours": 8 }
+```
+
+Each open the daemon records now carries the reason it was allowed (`auto_first_of_day`, `auto_quiet_period`, `reasoned`). Opens recorded before this version have no reason and are reconstructed from timing using your current quiet-period setting, so old events near that boundary can be misclassified.
+
+The Friday notification fires from the daemon on its first check at or after 16:00, so a Mac that was asleep at 16:00 gets it on wake, and it is sent once per week even across restarts. If the daemon isn't running at all that week, nothing is sent. The banner comes from `osascript`, so macOS may attribute it to **Script Editor** in System Settings → Notifications; allow it there if nothing appears.
 
 ## Customization
 

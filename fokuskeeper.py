@@ -32,6 +32,29 @@ STATE_FILE = Path.home() / ".fokuskeeper-state.json"
 HISTORY_FILE = Path.home() / ".fokuskeeper-history.json"
 CONFIG_FILE = Path.home() / ".fokuskeeper-config.json"  # {"enabled": [target keys]}
 
+# Time-saved model. A model under stated assumptions, not measured time:
+# every blocked distraction is credited MINUTES_SAVED_PER_BLOCK, every
+# "I have a reason" open debited MINUTES_COST_PER_REASONED_OPEN, and
+# auto-allows (first open of the day, quiet period) count for nothing on
+# either side because no dialog was shown and no decision was made. All
+# three are overridable in CONFIG_FILE.
+DEFAULT_MINUTES_SAVED_PER_BLOCK = 10
+DEFAULT_MINUTES_COST_PER_REASONED_OPEN = 1
+DEFAULT_WORKDAY_HOURS = 8
+
+# Weekly summary notification: fires once per week from the daemon, on the
+# first monitor tick at or after this weekday/hour (so a Mac asleep at 16:00
+# still gets it when it wakes). Weekday follows datetime.weekday(): Friday=4.
+WEEKLY_SUMMARY_WEEKDAY = 4
+WEEKLY_SUMMARY_HOUR = 16
+WEEKLY_SUMMARY_CHECK_SECONDS = 60
+
+# History "reason" values written on *_opened events, so reports can tell a
+# real "I have a reason" click from an auto-allow that never showed a dialog.
+REASON_FIRST_OF_DAY = "auto_first_of_day"
+REASON_QUIET_PERIOD = "auto_quiet_period"
+REASON_REASONED = "reasoned"
+
 # Pre-rename paths. Kept so migrate_legacy_files() can copy an existing
 # installation's data across; the legacy files stay in place as rollback.
 LEGACY_STATE_FILE = Path.home() / ".slack-gatekeeper-state.json"
@@ -196,6 +219,22 @@ def quiet_period_minutes():
     """Minutes of no use before the next open auto-allows, live-configurable
     via CONFIG_FILE."""
     return _load_config()[2]
+
+
+def time_saved_model():
+    """The three time-saved multipliers as a dict, from CONFIG_FILE with
+    per-field defaults. Read fresh each call: it's only consulted when a
+    report or the weekly summary is built, never on the monitor hot path.
+    """
+    raw = _read_raw_config()
+    return {
+        "minutes_saved_per_block": _positive_int_or(
+            raw.get("minutes_saved_per_block"), DEFAULT_MINUTES_SAVED_PER_BLOCK),
+        "minutes_cost_per_reasoned_open": _positive_int_or(
+            raw.get("minutes_cost_per_reasoned_open"), DEFAULT_MINUTES_COST_PER_REASONED_OPEN),
+        "workday_hours": _positive_int_or(
+            raw.get("workday_hours"), DEFAULT_WORKDAY_HOURS, max_value=24),
+    }
 
 
 def match_app_name(app_name, targets=None):
@@ -373,8 +412,13 @@ def _reset_daily_counters(state):
     state["daily_opens"] = 0
     state["distractions_prevented"] = 0
 
-def increment_daily_count(app_type="slack"):
-    """Increment today's open count for specified app and return new count."""
+def increment_daily_count(app_type="slack", reason=None):
+    """Increment today's open count for specified app and return new count.
+
+    `reason` (one of the REASON_* constants) is recorded on the history
+    event so reports can classify the open exactly instead of re-deriving
+    it from timestamps and the quiet period as configured today.
+    """
     state = load_state()
 
     # Reset counts if it's a new day
@@ -390,7 +434,7 @@ def increment_daily_count(app_type="slack"):
     save_state(state)
 
     # Save to history with specific type
-    save_to_history(f"{app_type}_opened")
+    save_to_history(f"{app_type}_opened", reason=reason)
 
     return count
 
@@ -415,7 +459,7 @@ def increment_prevented_count(app_type="slack"):
 
     return state[f"{app_type}_prevented"]
 
-def save_to_history(event_type):
+def save_to_history(event_type, reason=None):
     """Save event to historical log file with file locking."""
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -435,11 +479,14 @@ def save_to_history(event_type):
                 history = []
             
             # Append new event
-            history.append({
+            event = {
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "type": event_type  # "opened" or "prevented"
-            })
+            }
+            if reason is not None:
+                event["reason"] = reason
+            history.append(event)
             
             # Write back to file
             f.seek(0)
@@ -840,14 +887,14 @@ def handle_intercept(target, surface):
         return True
 
     if gate is Gate.FIRST_OPEN:
-        new_count = increment_daily_count(key)
+        new_count = increment_daily_count(key, reason=REASON_FIRST_OF_DAY)
         allow_access(key)
         log(f"First {target.label} open of the day - auto-allowed (#{new_count})")
         print(f"First {target.label} open today - allowed automatically")
         return True
 
     if gate is Gate.QUIET:
-        new_count = increment_daily_count(key)
+        new_count = increment_daily_count(key, reason=REASON_QUIET_PERIOD)
         allow_access(key)
         log(f"No {target.label} use in {quiet_period_minutes()}+ min - auto-allowed (#{new_count})")
         print(f"Quiet period - {target.label} allowed automatically")
@@ -860,7 +907,7 @@ def handle_intercept(target, surface):
     allowed = show_confirmation_dialog(target)
 
     if allowed:
-        new_count = increment_daily_count(key)
+        new_count = increment_daily_count(key, reason=REASON_REASONED)
         allow_access(key)
         surface.restore()
         log(f"Re-opened {target.label} (#{new_count} today)")
@@ -888,9 +935,9 @@ def handle_intercept(target, surface):
 # Confirmation dialog
 # ============================================================================
 
-def format_time_rescued(prevented):
-    """Human time saved: 10 minutes per blocked distraction."""
-    minutes_rescued = prevented * 10
+def format_time_rescued(prevented, minutes_per_block=DEFAULT_MINUTES_SAVED_PER_BLOCK):
+    """Human time saved: minutes_per_block (default 10) per blocked distraction."""
+    minutes_rescued = prevented * minutes_per_block
     hours_rescued, remaining_minutes = divmod(minutes_rescued, 60)
     if hours_rescued > 0:
         return f"{hours_rescued}h {remaining_minutes}m"
@@ -953,7 +1000,8 @@ def build_dialog_message(stats, target):
     total_prevented = sum(validate_counter(s["prevented"]) for s in stats)
 
     success_rate = compute_success_rate(total_opens, total_prevented)
-    time_rescued = format_time_rescued(total_prevented)
+    time_rescued = format_time_rescued(
+        total_prevented, time_saved_model()["minutes_saved_per_block"])
     motivation = motivation_for(success_rate)
     label = sanitize_for_applescript(target.label)
 
@@ -1051,9 +1099,13 @@ def monitor():
     print(f"  If an app hasn't been used in {quiet_period_minutes()}+ minutes, the next")
     print("  open is let through without a prompt (checked per app).")
     print()
-    print("💾 TIME RESCUED CALCULATION:")
-    print("  Each blocked distraction saves ~10 minutes of focus time")
-    print("  (average time spent checking + context switching cost)")
+    model = time_saved_model()
+    print("💾 TIME SAVED MODEL:")
+    print(f"  Each blocked distraction saves ~{model['minutes_saved_per_block']} minutes of focus time")
+    print(f"  (average time spent checking + context switching cost); each")
+    print(f"  'I have a reason' open costs ~{model['minutes_cost_per_reasoned_open']} min of dialog time.")
+    print(f"  A summary notification arrives every Friday at {WEEKLY_SUMMARY_HOUR}:00.")
+    print("  Run 'fokuskeeper timesaved' any time for the same numbers.")
     print()
     print("⚙️  CUSTOMIZE TIMING:")
     print("  Run 'fokuskeeper timing' or use the menu bar's Adjust timing... item")
@@ -1071,10 +1123,15 @@ def monitor():
 
     last_app_key = None   # key of the app target that was frontmost last tick
     last_web_key = None   # key of the web target the Chrome tab showed last tick
+    last_weekly_check = 0.0  # monotonic seconds; the weekly check is once a minute, not every tick
 
     try:
         while True:
             try:
+                if time.monotonic() - last_weekly_check >= WEEKLY_SUMMARY_CHECK_SECONDS:
+                    last_weekly_check = time.monotonic()
+                    maybe_send_weekly_summary()
+
                 current_frontmost = get_frontmost_app()
                 targets = enabled_targets()  # one config stat per tick
 
@@ -1367,6 +1424,247 @@ def cmd_report():
     print(f"  Total opens: {total_opened}")
     print(f"  Total blocked: {total_prevented}")
 
+# ============================================================================
+# Time-saved model
+# ============================================================================
+
+CLASS_STAY_FOCUSED = "stay_focused"
+CLASS_REASONED = REASON_REASONED
+CLASS_AUTO_FIRST_OF_DAY = REASON_FIRST_OF_DAY
+CLASS_AUTO_QUIET_PERIOD = REASON_QUIET_PERIOD
+_VALID_OPEN_REASONS = (CLASS_REASONED, CLASS_AUTO_FIRST_OF_DAY, CLASS_AUTO_QUIET_PERIOD)
+
+
+def _event_datetime(event):
+    try:
+        return datetime.strptime(f"{event['date']} {event['time']}", "%Y-%m-%d %H:%M:%S")
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def classify_history(history, quiet_minutes):
+    """Every open/prevented event as {"ts", "target", "cls"}, chronological.
+
+    `*_prevented` is always stay_focused. An `*_opened` event with a
+    recorded "reason" field uses it verbatim. Older events without one are
+    reconstructed from timing, per target: first event of that target's
+    day -> auto_first_of_day; else a gap since the target's previous event
+    of quiet_minutes or more -> auto_quiet_period; else reasoned. That
+    reconstruction uses TODAY's quiet period, so events recorded under a
+    different setting can land on the wrong side of the line -- which is
+    exactly why the daemon now writes the reason at the time of the open.
+    """
+    rows = []
+    for event in history:
+        bucket = _bucket_event_type(event.get("type"))
+        ts = _event_datetime(event)
+        if bucket is None or ts is None:
+            continue
+        rows.append((ts, bucket[0], bucket[1], event.get("reason")))
+    rows.sort(key=lambda row: row[0])
+
+    classified = []
+    last_seen = {}
+    for ts, target, kind, reason in rows:
+        if kind == "prevented":
+            cls = CLASS_STAY_FOCUSED
+        elif reason in _VALID_OPEN_REASONS:
+            cls = reason
+        else:
+            previous = last_seen.get(target)
+            if previous is None or previous.date() != ts.date():
+                cls = CLASS_AUTO_FIRST_OF_DAY
+            elif (ts - previous) >= timedelta(minutes=quiet_minutes):
+                cls = CLASS_AUTO_QUIET_PERIOD
+            else:
+                cls = CLASS_REASONED
+        last_seen[target] = ts
+        classified.append({"ts": ts, "target": target, "cls": cls})
+    return classified
+
+
+def summarize_time_saved(classified, model, start=None, end=None):
+    """Counts and modeled minutes for events with start <= ts < end.
+
+    Auto-allows are counted (so the attempt total is honest) but excluded
+    from both sides of the arithmetic: no dialog, no decision, nothing to
+    credit or charge.
+    """
+    rows = [
+        row for row in classified
+        if (start is None or row["ts"] >= start) and (end is None or row["ts"] < end)
+    ]
+    counts = {
+        CLASS_STAY_FOCUSED: 0, CLASS_REASONED: 0,
+        CLASS_AUTO_FIRST_OF_DAY: 0, CLASS_AUTO_QUIET_PERIOD: 0,
+    }
+    per_target = {}
+    for row in rows:
+        counts[row["cls"]] += 1
+        target_counts = per_target.setdefault(row["target"], dict.fromkeys(counts, 0))
+        target_counts[row["cls"]] += 1
+
+    blocked = counts[CLASS_STAY_FOCUSED]
+    reasoned = counts[CLASS_REASONED]
+    saved = blocked * model["minutes_saved_per_block"]
+    cost = reasoned * model["minutes_cost_per_reasoned_open"]
+    net = saved - cost
+    decisions = blocked + reasoned
+    active_days = sorted({row["ts"].date() for row in rows})
+    return {
+        "attempts": len(rows),
+        "blocked": blocked,
+        "reasoned": reasoned,
+        "auto_allowed": counts[CLASS_AUTO_FIRST_OF_DAY] + counts[CLASS_AUTO_QUIET_PERIOD],
+        "block_rate": (blocked / decisions) if decisions else None,
+        "minutes_saved": saved,
+        "minutes_cost": cost,
+        "net_minutes": net,
+        "net_workdays": net / 60 / model["workday_hours"],
+        "active_days": len(active_days),
+        "first_date": active_days[0] if active_days else None,
+        "last_date": active_days[-1] if active_days else None,
+        "per_target": per_target,
+    }
+
+
+def format_minutes(minutes):
+    sign = "-" if minutes < 0 else ""
+    hours, mins = divmod(abs(int(minutes)), 60)
+    return f"{sign}{hours}h {mins:02d}m" if hours else f"{sign}{mins}m"
+
+
+def format_time_saved_summary(summary, model, heading):
+    """Multi-line text for one window. Block count sits next to net minutes
+    on purpose: at the default 10:1 ratio net time tracks blocks almost
+    one-to-one, and that arithmetic should stay visible."""
+    lines = [heading]
+    if summary["attempts"] == 0:
+        lines.append("  No attempts recorded.")
+        return "\n".join(lines)
+    lines.append(
+        f"  {summary['first_date']} to {summary['last_date']}, "
+        f"{summary['active_days']} active day{'s' if summary['active_days'] != 1 else ''}"
+    )
+    lines.append(
+        f"  Attempts {summary['attempts']}: blocked {summary['blocked']}, "
+        f"reasoned {summary['reasoned']}, auto-allowed {summary['auto_allowed']}"
+    )
+    rate = summary["block_rate"]
+    lines.append(f"  Block rate (dialogs only): {rate:.0%}" if rate is not None else
+                 "  Block rate (dialogs only): n/a (no dialogs shown)")
+    lines.append(
+        f"  Saved {format_minutes(summary['minutes_saved'])} "
+        f"({summary['blocked']} x {model['minutes_saved_per_block']} min) "
+        f"- cost {format_minutes(summary['minutes_cost'])} "
+        f"({summary['reasoned']} x {model['minutes_cost_per_reasoned_open']} min) "
+        f"= net {format_minutes(summary['net_minutes'])}"
+    )
+    if summary["active_days"]:
+        per_day = summary["net_minutes"] / summary["active_days"]
+        lines.append(
+            f"  Net per active day {format_minutes(per_day)}; "
+            f"{summary['net_workdays']:.2f} workdays of {model['workday_hours']}h"
+        )
+    for key in TARGET_KEYS:
+        counts = summary["per_target"].get(key)
+        if not counts:
+            continue
+        blocked, reasoned = counts[CLASS_STAY_FOCUSED], counts[CLASS_REASONED]
+        auto = counts[CLASS_AUTO_FIRST_OF_DAY] + counts[CLASS_AUTO_QUIET_PERIOD]
+        net = blocked * model["minutes_saved_per_block"] - reasoned * model["minutes_cost_per_reasoned_open"]
+        lines.append(
+            f"    {TARGET_LABELS[key]}: blocked {blocked}, reasoned {reasoned}, "
+            f"auto {auto}, net {format_minutes(net)}"
+        )
+    return "\n".join(lines)
+
+
+def cmd_timesaved():
+    """Print the time-saved model for the last 7 days and for all time."""
+    history = load_history()
+    model = time_saved_model()
+    classified = classify_history(history, quiet_period_minutes())
+    now = datetime.now()
+    print("FokusKeeper - Time saved (modeled, not measured)")
+    print(format_time_saved_summary(
+        summarize_time_saved(classified, model, start=now - timedelta(days=7), end=now),
+        model, "Last 7 days:"))
+    print(format_time_saved_summary(
+        summarize_time_saved(classified, model), model, "All time:"))
+    print("  Deterrence isn't recorded: opens that never happened because the")
+    print("  gate exists don't appear, so this is a lower bound on the model.")
+
+
+# ============================================================================
+# Weekly summary notification
+# ============================================================================
+
+def weekly_summary_due_at(now):
+    """The most recent WEEKLY_SUMMARY_WEEKDAY at WEEKLY_SUMMARY_HOUR:00 that
+    is <= now. The summary for that moment covers the 7 days before it."""
+    candidate = now.replace(hour=WEEKLY_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
+    days_back = (now.weekday() - WEEKLY_SUMMARY_WEEKDAY) % 7
+    candidate -= timedelta(days=days_back)
+    if candidate > now:
+        candidate -= timedelta(days=7)
+    return candidate
+
+
+def weekly_summary_text(summary, model):
+    """One-line notification body. Blocks and reasoned opens stay next to the
+    net figure so the number can't be read without the count behind it."""
+    if summary["attempts"] == 0:
+        return "No attempts recorded this week."
+    return (
+        f"{summary['blocked']} blocked, {summary['reasoned']} reasoned, "
+        f"{summary['auto_allowed']} auto - net ~{format_minutes(summary['net_minutes'])} "
+        f"saved (model: {model['minutes_saved_per_block']} min/block)"
+    )
+
+
+def show_notification(title, subtitle, body):
+    """macOS banner via osascript. Returns True on success."""
+    script = (
+        f'display notification "{sanitize_for_applescript(body)}" '
+        f'with title "{sanitize_for_applescript(title)}" '
+        f'subtitle "{sanitize_for_applescript(subtitle)}"'
+    )
+    result = _run(["osascript", "-e", script])
+    return result.returncode == 0
+
+
+def maybe_send_weekly_summary(now=None):
+    """Send the weekly summary once per due moment. Returns True if sent.
+
+    Idempotent across ticks and restarts: the due moment it was sent for is
+    recorded in the state file, so a daemon restart on Friday evening
+    doesn't fire it twice, and one that was off at 16:00 fires on its first
+    check afterwards (until the next Friday 16:00 supersedes it).
+    """
+    now = now or datetime.now()
+    due = weekly_summary_due_at(now)
+    marker = due.isoformat(timespec="minutes")
+    state = load_state()
+    if state.get("weekly_summary_sent_for") == marker:
+        return False
+
+    model = time_saved_model()
+    classified = classify_history(load_history(), quiet_period_minutes())
+    summary = summarize_time_saved(classified, model, start=due - timedelta(days=7), end=due)
+    body = weekly_summary_text(summary, model)
+    week_label = f"Week ending {due.strftime('%a %d %b')}"
+    sent = show_notification("FokusKeeper", week_label, body)
+    log(f"Weekly summary ({week_label}): {body}" + ("" if sent else " [notification failed]"))
+
+    # Record the attempt either way: a notification that macOS refused
+    # (permissions) would otherwise be retried every minute all week.
+    state = load_state()
+    state["weekly_summary_sent_for"] = marker
+    save_state(state)
+    return sent
+
+
 def save_config(config):
     """Write CONFIG_FILE with user-only permissions."""
     _write_json_file(CONFIG_FILE, config)
@@ -1589,11 +1887,12 @@ def main(argv=None):
         "command",
         nargs="?",
         default="run",
-        choices=["run", "stats", "status", "history", "report", "reset",
-                 "settings"],
+        choices=["run", "stats", "status", "history", "report", "timesaved",
+                 "reset", "settings"],
         help="run: start the monitor daemon (default); stats: today's numbers; "
              "status: daemon liveness + stats; history: last 7 days; "
-             "report: all-time totals; reset: zero today's counters; "
+             "report: all-time totals; timesaved: modeled time saved, last 7 "
+             "days and all time; reset: zero today's counters; "
              "settings: choose which apps to gate and adjust cooldown/"
              "quiet-period minutes",
     )
@@ -1609,6 +1908,7 @@ def main(argv=None):
         "status": cmd_status,
         "history": cmd_history,
         "report": cmd_report,
+        "timesaved": cmd_timesaved,
         "reset": cmd_reset,
         "settings": cmd_settings,
     }
