@@ -19,7 +19,7 @@ That is the whole product. It is a speed bump, not a wall. Most distraction chec
 
 [**Download FokusKeeper**](https://github.com/cipshadow/fokuskeeper/releases/latest/download/FokusKeeper-Install.zip)
 
-Unzip it, then double-click `FokusKeeper-Install.command`. A Terminal window opens itself, downloads the app, and installs it -- no typing required.
+Unzip it, then double-click `FokusKeeper-Install.command`. A Terminal window opens itself, downloads the reviewed release revision, and installs it -- no typing required. It does not silently follow later changes on the default branch; download a newer release asset when you want to upgrade.
 
 Since this isn't a signed app, macOS will likely block it the first time with no direct "Open" option. If that happens: go to **System Settings -> Privacy & Security**, scroll down to the blocked-item notice near the bottom, click **Open Anyway**, then double-click the file again and confirm once more. One-time only.
 
