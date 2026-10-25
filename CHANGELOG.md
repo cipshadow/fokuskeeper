@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.0 - 2026-10-25
+
+- **Settings works in the downloadable app.** Clicking Settings... in the packaged app did nothing; it now opens the Settings window.
+- **Settings opens faster.** The ~3-second wait on every click is gone. The first open after installing can still take a couple of seconds while macOS checks the new files.
+- **Settings can't freeze the menu bar.** Closing the window with its red button used to leave a hidden process running, which froze the menu bar icon. Settings also no longer adds a Python icon to the Dock. Clicking Settings while it's open brings the window forward.
+- **New: "Show the prompt" setting.** Choose 0-100% (default 100%) to show the prompt only that share of the times it would appear. Skipped prompts let you through, start the cooldown, and count as auto-allowed in your stats.
+- **One icon everywhere.** The shield-with-K now shows in the menu bar and as the app icon in Finder.
+
 ## 1.4.0 - 2026-09-10
 
 - **Time saved model**: `fokuskeeper timesaved` prints modeled minutes saved for the last 7 days and all time, per app, with the block/reasoned/auto-allowed counts next to the net figure so the arithmetic stays visible. Blocks credit 10 min, reasoned opens debit 1 min, auto-allows count for nothing; all three multipliers and the workday length are overridable in `~/.fokuskeeper-config.json`. The dialog's "Time Rescued" line uses the same multiplier.
