@@ -1,9 +1,10 @@
 """The one shield-with-K drawing, shared by every place FokusKeeper shows an
-icon: the menu bar item, the Settings window's Dock icon, and the app icon
-(scripts/make_icon.py renders assets/FokusKeeper.icns from it). Keeping a
+icon: the menu bar item and the app icon (scripts/make_icon.py renders
+assets/FokusKeeper.icns from it). Keeping a
 single drawing is what keeps them identical.
 
-AppKit only, no rumps, so the daemon's Settings panel can import it too.
+AppKit only, no rumps, so scripts/make_icon.py can import it without the
+menu bar's dependencies.
 """
 
 import AppKit
