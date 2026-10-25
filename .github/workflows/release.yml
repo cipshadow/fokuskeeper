@@ -55,5 +55,6 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             FokusKeeper.dmg FokusKeeper.dmg.sha256 \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "FokusKeeper ${GITHUB_REF_NAME}" \
             --generate-notes
