@@ -54,6 +54,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/FokusKeeper.dmg dist/FokusKeeper.dmg.sha256 \
+            FokusKeeper.dmg FokusKeeper.dmg.sha256 \
             --title "FokusKeeper ${GITHUB_REF_NAME}" \
             --generate-notes
