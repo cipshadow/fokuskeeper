@@ -17,13 +17,13 @@ That is the whole product. It is a speed bump, not a wall. Most distraction chec
 
 ## Download
 
-[**Download FokusKeeper**](https://github.com/cipshadow/fokuskeeper/releases/latest/download/FokusKeeper-Install.zip)
+[**Download the latest FokusKeeper DMG**](https://github.com/cipshadow/fokuskeeper/releases/latest)
 
-Unzip it, then double-click `FokusKeeper-Install.command`. A Terminal window opens itself, downloads the reviewed release revision, and installs it -- no typing required. It does not silently follow later changes on the default branch; download a newer release asset when you want to upgrade.
+Open `FokusKeeper.dmg`, then drag **FokusKeeper.app** to the Applications shortcut. Open the app from Applications. It runs as a menu-bar app, so it does not appear in the Dock.
 
-Since this isn't a signed app, macOS will likely block it the first time with no direct "Open" option. If that happens: go to **System Settings -> Privacy & Security**, scroll down to the blocked-item notice near the bottom, click **Open Anyway**, then double-click the file again and confirm once more. One-time only.
+FokusKeeper is unsigned by design. On its first launch, Control-click **FokusKeeper.app**, choose **Open**, then choose **Open** in the confirmation dialog. macOS remembers that choice for this installed build. If macOS does not show that option, attempt to open it once, then use **System Settings -> Privacy & Security -> Open Anyway**.
 
-Prefer git? See [Manual install](#install) below.
+Each release includes a `FokusKeeper.dmg.sha256` file. Verify it from Terminal with `shasum -a 256 FokusKeeper.dmg` before opening the DMG if you want to confirm the download.
 
 ## Apps
 
@@ -44,7 +44,7 @@ You pick which of these to gate at first run; all ten are pre-selected. Firefox 
 
 ## How it works
 
-A Python daemon (`fokuskeeper.py`, stdlib only) polls the frontmost application every 0.5 seconds via `osascript`. When Chrome or Safari is frontmost it also reads the active tab's URL. Detection is edge-triggered: an app prompts when you switch to it, not continuously while you stay on it.
+The bundled FokusKeeper daemon polls the frontmost application every 0.5 seconds via `osascript`. When Chrome or Safari is frontmost it also reads the active tab's URL. Detection is edge-triggered: an app prompts when you switch to it, not continuously while you stay on it.
 
 On each detected open, the gate decides in strict precedence order:
 
@@ -57,22 +57,16 @@ Cooldowns are shared per app across surfaces: allowing the Slack app also covers
 
 ## Prerequisites
 
-- macOS 12 or later
-- Python 3.9+ (stdlib only for the daemon itself; the system `python3` works). A fresh Mac without developer tools will offer to install the Xcode Command Line Tools the first time you run `python3`; accept that, or `brew install python`.
+- macOS 13 or later, on an Intel or Apple Silicon Mac
 - Google Chrome and/or Safari, if you want web gating (the app surfaces work without either)
-- Internet access during install, to fetch `rumps` for the menu bar icon (see below — the daemon still works fine without it)
 
 ## Install
 
-```bash
-git clone https://github.com/cipshadow/fokuskeeper.git
-cd fokuskeeper
-./install.sh
-```
+Download the latest DMG from [Releases](https://github.com/cipshadow/fokuskeeper/releases), drag the app to Applications, then launch it. No terminal, source checkout, Python, Homebrew, or network access after download is required.
 
-The installer checks for `python3`, sets up a menu bar icon (a small `.venv` with `rumps`), builds `~/Applications/FokusKeeper.app` as the login launcher, and starts everything. Add the app to System Settings -> General -> Login Items to start it at login. Pass `--with-control-panel` to also get a `FOKUSKEEPER.command` start/stop/stats panel on your Desktop.
+At the first launch, the menu-bar icon starts FokusKeeper and the daemon. Add **FokusKeeper** in **System Settings -> General -> Login Items** if you want it to start when you sign in.
 
-If the menu bar setup can't complete (no network, or no build tools for one of its dependencies), install continues anyway with a plain headless daemon — no menu bar icon, but gating still works fully. Retry the menu bar setup any time with `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && ./start-menubar.sh`, then re-run `./install.sh` to regenerate the login launcher so it picks it up automatically.
+Developers who want to work from source can use the scripts in this repository. That workflow is separate from the supported release install path.
 
 On first run a short welcome screen explains how the dialog and cooldown work, then a native chooser lists all ten apps, pre-selected (deselect any you want ungated), followed by the Settings window for cooldown and quiet-period minutes. Your choices are saved to `~/.fokuskeeper-config.json`. Change any of it again any time from the menu bar icon's **Settings...** menu item.
 
@@ -80,9 +74,11 @@ On first run a short welcome screen explains how the dialog and cooldown work, t
 
 macOS asks for **Automation** permission the first time FokusKeeper talks to System Events (frontmost-app polling), Google Chrome, and Safari (tab reading) -- each browser is a separate grant, only asked for the ones you actually use. Click Allow.
 
-Grants are **per launching app**: the daemon started from your terminal and the daemon started by FokusKeeper.app each need their own grant. If web gating stops silently after you switch how the daemon starts, run `./fokuskeeper logs` and look for a `WARNING: Cannot read ... tabs` line, then re-grant Automation for that browser to the launching app in System Settings -> Privacy & Security -> Automation.
+Grants are tied to the installed FokusKeeper app. If browser gating does not work, check **System Settings -> Privacy & Security -> Automation** and allow FokusKeeper to control the affected browser.
 
-## Usage
+## Developer CLI
+
+The released app is controlled from its menu-bar icon. The following commands are for a source checkout only:
 
 ```bash
 ./fokuskeeper start      # start the daemon
@@ -131,16 +127,17 @@ The Friday notification fires from the daemon on its first check at or after 16:
 ## Customization
 
 - **Apps and timing**: click **Settings...** in the menu bar icon's menu, or run `./fokuskeeper settings` from a terminal -- both open one window with the app checklist and both timing fields (cooldown and quiet-period minutes, 1-1440 each) together, pre-filled with your current values. Save writes everything at once; Cancel leaves your existing settings untouched. Changes apply live; the daemon watches the config file's mtime, no restart needed. (A headless install without the menu bar's `rumps`/AppKit dependency falls back to three separate native dialogs instead -- same settings, same result.)
-- **Menu bar icon**: installed by default (see Install above). A shield-with-K icon shows daemon state; click it to start/stop. To start it manually without logging out and back in, run `./start-menubar.sh` — it prefers the repo's `.venv` automatically and starts the daemon itself if it isn't already running.
+- **Menu bar icon**: a shield-with-K icon shows daemon state. Click it to start or stop FokusKeeper. If it is not visible, check the hidden-items area of any menu-bar organizer you use.
 
 ## Uninstall
 
-```bash
-./uninstall.sh           # stop everything, remove the launcher app and Desktop panel
-./uninstall.sh --purge   # also delete state, history, config, and logs
-```
+Quit FokusKeeper from its menu-bar menu, remove **FokusKeeper.app** from Applications, and remove it from Login Items if you added it there. To also remove its local settings and history, delete `~/.fokuskeeper-state.json`, `~/.fokuskeeper-history.json`, and `~/.fokuskeeper-config.json`.
 
-`--purge` also removes leftover files from the legacy naming (`~/.slack-gatekeeper-state.json` and friends). Removing the Login Items entry is a manual step; the script tells you where.
+The source-tree `uninstall.sh --purge` remains available for developers and removes legacy files too.
+
+## Releases
+
+Pushing a `v*` tag builds and publishes an unsigned universal DMG. Pull requests run the same build without publishing it. The build uses universal2 Python, checks every bundled Mach-O file for both `x86_64` and `arm64`, and sets the app's minimum supported macOS version to 13.0.
 
 ## FAQ
 
