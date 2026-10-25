@@ -4,6 +4,7 @@ FokusKeeper - Prevents mindless distraction checking by requiring intentional pu
 """
 import argparse
 import os
+import random
 import shutil
 import signal
 import sys
@@ -57,6 +58,7 @@ WEEKLY_SUMMARY_CHECK_SECONDS = 60
 # real "I have a reason" click from an auto-allow that never showed a dialog.
 REASON_FIRST_OF_DAY = "auto_first_of_day"
 REASON_QUIET_PERIOD = "auto_quiet_period"
+REASON_PROMPT_SKIPPED = "auto_prompt_skipped"
 REASON_REASONED = "reasoned"
 
 # Pre-rename paths. Kept so migrate_legacy_files() can copy an existing
@@ -122,6 +124,8 @@ BROWSERS_BY_APP_NAME = {b.app_name: b for b in BROWSERS}
 # cooldown_minutes value never resets the enabled-targets list too.
 DEFAULT_COOLDOWN_MINUTES = 3
 DEFAULT_QUIET_PERIOD_MINUTES = 60
+DEFAULT_PROMPT_PERCENT = 100  # 100 = always prompt, i.e. the pre-setting behaviour
+PROMPT_PERCENT_STEP = 5
 
 # Config cache. The daemon calls enabled_targets()/cooldown_minutes()/
 # quiet_period_minutes() every 0.5s tick, so we stat CONFIG_FILE (cheap) and
@@ -134,6 +138,7 @@ _config_cache = {
     "targets": TARGETS,
     "cooldown_minutes": DEFAULT_COOLDOWN_MINUTES,
     "quiet_period_minutes": DEFAULT_QUIET_PERIOD_MINUTES,
+    "prompt_percent": DEFAULT_PROMPT_PERCENT,
 }
 
 
@@ -153,17 +158,31 @@ def _positive_int_or(value, default, max_value=1440):
     return value
 
 
+def _percent_or(value, default):
+    """An integer 0-100 snapped to PROMPT_PERCENT_STEP, else `default`.
+    Unlike _positive_int_or, 0 is valid here (never prompt). Never raises."""
+    try:
+        value = float(str(value).strip().rstrip("%"))
+    except (ValueError, TypeError):
+        return default
+    if not 0 <= value <= 100:
+        return default
+    return int(round(value / PROMPT_PERCENT_STEP) * PROMPT_PERCENT_STEP)
+
+
 def _parse_config(path):
-    """Parse CONFIG_FILE into (targets, cooldown_minutes, quiet_period_minutes).
+    """Parse CONFIG_FILE into (targets, cooldown_minutes, quiet_period_minutes,
+    prompt_percent).
 
     Expected shape: {"enabled": [...], "cooldown_minutes": N,
-    "quiet_period_minutes": N}. Unknown keys are silently ignored. Any
+    "quiet_period_minutes": N, "prompt_percent": N}. Unknown keys are silently ignored. Any
     deviation in a field — missing, wrong type, out of bounds — falls back
     to that field's own default, independently of the other fields. A
     fully corrupt/unreadable/non-dict file falls back to all-defaults.
     Never raises.
     """
-    defaults = (TARGETS, DEFAULT_COOLDOWN_MINUTES, DEFAULT_QUIET_PERIOD_MINUTES)
+    defaults = (TARGETS, DEFAULT_COOLDOWN_MINUTES, DEFAULT_QUIET_PERIOD_MINUTES,
+                DEFAULT_PROMPT_PERCENT)
     try:
         with open(path, "r") as f:
             data = json.load(f)
@@ -181,7 +200,8 @@ def _parse_config(path):
 
     cooldown = _positive_int_or(data.get("cooldown_minutes"), DEFAULT_COOLDOWN_MINUTES)
     quiet = _positive_int_or(data.get("quiet_period_minutes"), DEFAULT_QUIET_PERIOD_MINUTES)
-    return targets, cooldown, quiet
+    percent = _percent_or(data.get("prompt_percent"), DEFAULT_PROMPT_PERCENT)
+    return targets, cooldown, quiet, percent
 
 
 def _load_config():
@@ -192,16 +212,19 @@ def _load_config():
         mtime_ns = os.stat(path).st_mtime_ns
     except OSError:
         # File absent (or unstatable): all-defaults.
-        return TARGETS, DEFAULT_COOLDOWN_MINUTES, DEFAULT_QUIET_PERIOD_MINUTES
+        return (TARGETS, DEFAULT_COOLDOWN_MINUTES, DEFAULT_QUIET_PERIOD_MINUTES,
+                DEFAULT_PROMPT_PERCENT)
     cache = _config_cache
     if cache["path"] == path and cache["mtime_ns"] == mtime_ns:
-        return cache["targets"], cache["cooldown_minutes"], cache["quiet_period_minutes"]
-    targets, cooldown, quiet = _parse_config(path)
+        return (cache["targets"], cache["cooldown_minutes"],
+                cache["quiet_period_minutes"], cache["prompt_percent"])
+    targets, cooldown, quiet, percent = _parse_config(path)
     _config_cache = {
         "path": path, "mtime_ns": mtime_ns,
         "targets": targets, "cooldown_minutes": cooldown, "quiet_period_minutes": quiet,
+        "prompt_percent": percent,
     }
-    return targets, cooldown, quiet
+    return targets, cooldown, quiet, percent
 
 
 def enabled_targets():
@@ -223,6 +246,12 @@ def quiet_period_minutes():
     """Minutes of no use before the next open auto-allows, live-configurable
     via CONFIG_FILE."""
     return _load_config()[2]
+
+
+def prompt_percent():
+    """Share (0-100) of would-be prompts that are actually shown,
+    live-configurable via CONFIG_FILE. The rest pass as auto-allows."""
+    return _load_config()[3]
 
 
 def time_saved_model():
@@ -821,11 +850,14 @@ class Gate(Enum):
     COOLDOWN = "cooldown"      # inside the grant window: silent allow
     FIRST_OPEN = "first_open"  # first open of the day: auto-allow
     QUIET = "quiet"            # idle for the quiet-period threshold+: auto-allow
+    SKIPPED = "skipped"        # would prompt, but lost the prompt_percent roll: auto-allow
     PROMPT = "prompt"          # none of the above: intercept and ask
 
 
-def evaluate_gate(target):
-    """Pure gate decision for a target. Precedence: COOLDOWN > FIRST_OPEN > QUIET > PROMPT."""
+def evaluate_gate(target, roll=None):
+    """Gate decision for a target. Precedence: COOLDOWN > FIRST_OPEN > QUIET >
+    SKIPPED > PROMPT. `roll` (0 <= roll < 100) decides SKIPPED vs PROMPT;
+    tests pass it to stay deterministic, the daemon leaves it random."""
     key = target.key
     if is_in_cooldown(key):
         return Gate.COOLDOWN
@@ -833,6 +865,10 @@ def evaluate_gate(target):
         return Gate.FIRST_OPEN
     if is_quiet_period(key):
         return Gate.QUIET
+    if roll is None:
+        roll = random.random() * 100
+    if roll >= prompt_percent():
+        return Gate.SKIPPED
     return Gate.PROMPT
 
 
@@ -902,6 +938,14 @@ def handle_intercept(target, surface):
         allow_access(key)
         log(f"No {target.label} use in {quiet_period_minutes()}+ min - auto-allowed (#{new_count})")
         print(f"Quiet period - {target.label} allowed automatically")
+        return True
+
+    if gate is Gate.SKIPPED:
+        # Counts as an allowed open (starts the cooldown, recorded with its
+        # own reason) so stats stay honest about what got through unasked.
+        new_count = increment_daily_count(key, reason=REASON_PROMPT_SKIPPED)
+        allow_access(key)
+        log(f"{target.label} prompt skipped ({prompt_percent()}% setting) - auto-allowed (#{new_count})")
         return True
 
     # Gate.PROMPT — intercept!
@@ -1436,7 +1480,10 @@ CLASS_STAY_FOCUSED = "stay_focused"
 CLASS_REASONED = REASON_REASONED
 CLASS_AUTO_FIRST_OF_DAY = REASON_FIRST_OF_DAY
 CLASS_AUTO_QUIET_PERIOD = REASON_QUIET_PERIOD
-_VALID_OPEN_REASONS = (CLASS_REASONED, CLASS_AUTO_FIRST_OF_DAY, CLASS_AUTO_QUIET_PERIOD)
+CLASS_AUTO_PROMPT_SKIPPED = REASON_PROMPT_SKIPPED
+_VALID_OPEN_REASONS = (CLASS_REASONED, CLASS_AUTO_FIRST_OF_DAY, CLASS_AUTO_QUIET_PERIOD,
+                       CLASS_AUTO_PROMPT_SKIPPED)
+_AUTO_CLASSES = (CLASS_AUTO_FIRST_OF_DAY, CLASS_AUTO_QUIET_PERIOD, CLASS_AUTO_PROMPT_SKIPPED)
 
 
 def _event_datetime(event):
@@ -1500,7 +1547,7 @@ def summarize_time_saved(classified, model, start=None, end=None):
     ]
     counts = {
         CLASS_STAY_FOCUSED: 0, CLASS_REASONED: 0,
-        CLASS_AUTO_FIRST_OF_DAY: 0, CLASS_AUTO_QUIET_PERIOD: 0,
+        CLASS_AUTO_FIRST_OF_DAY: 0, CLASS_AUTO_QUIET_PERIOD: 0, CLASS_AUTO_PROMPT_SKIPPED: 0,
     }
     per_target = {}
     for row in rows:
@@ -1519,7 +1566,7 @@ def summarize_time_saved(classified, model, start=None, end=None):
         "attempts": len(rows),
         "blocked": blocked,
         "reasoned": reasoned,
-        "auto_allowed": counts[CLASS_AUTO_FIRST_OF_DAY] + counts[CLASS_AUTO_QUIET_PERIOD],
+        "auto_allowed": sum(counts[c] for c in _AUTO_CLASSES),
         "block_rate": (blocked / decisions) if decisions else None,
         "minutes_saved": saved,
         "minutes_cost": cost,
@@ -1575,7 +1622,7 @@ def format_time_saved_summary(summary, model, heading):
         if not counts:
             continue
         blocked, reasoned = counts[CLASS_STAY_FOCUSED], counts[CLASS_REASONED]
-        auto = counts[CLASS_AUTO_FIRST_OF_DAY] + counts[CLASS_AUTO_QUIET_PERIOD]
+        auto = sum(counts[c] for c in _AUTO_CLASSES)
         net = blocked * model["minutes_saved_per_block"] - reasoned * model["minutes_cost_per_reasoned_open"]
         lines.append(
             f"    {TARGET_LABELS[key]}: blocked {blocked}, reasoned {reasoned}, "
@@ -1825,9 +1872,9 @@ def cmd_settings():
     except ImportError:
         _run_settings_sequential()
     else:
-        result, new_enabled, cooldown_text, quiet_text = show_settings_panel(
+        result, new_enabled, cooldown_text, quiet_text, percent_text = show_settings_panel(
             TARGETS, [t.key for t in enabled_targets()],
-            cooldown_minutes(), quiet_period_minutes(),
+            cooldown_minutes(), quiet_period_minutes(), prompt_percent(),
         )
         if result != "save":
             log("Settings panel cancelled - config left untouched")
@@ -1836,16 +1883,19 @@ def cmd_settings():
             config["enabled"] = new_enabled
             config["cooldown_minutes"] = _positive_int_or(cooldown_text, cooldown_minutes())
             config["quiet_period_minutes"] = _positive_int_or(quiet_text, quiet_period_minutes())
+            config["prompt_percent"] = _percent_or(percent_text, prompt_percent())
             save_config(config)
             log(
                 f"Settings saved: enabled apps = {', '.join(new_enabled) or 'none'}, "
                 f"cooldown={config['cooldown_minutes']}min, "
-                f"quiet_period={config['quiet_period_minutes']}min"
+                f"quiet_period={config['quiet_period_minutes']}min, "
+                f"prompt_percent={config['prompt_percent']}%"
             )
 
     labels = ", ".join(t.label for t in enabled_targets())
     print(f"Enabled apps: {labels}")
-    print(f"Cooldown: {cooldown_minutes()} minutes. Quiet period: {quiet_period_minutes()} minutes.")
+    print(f"Cooldown: {cooldown_minutes()} minutes. Quiet period: {quiet_period_minutes()} minutes. "
+          f"Prompt shown: {prompt_percent()}% of the time.")
 
 
 def cmd_run():

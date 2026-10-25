@@ -1,5 +1,6 @@
 """One native window for everything `fokuskeeper settings` configures:
-which apps to watch, plus the cooldown and quiet-period minutes.
+which apps to watch, the cooldown and quiet-period minutes, and how often the
+prompt is shown.
 
 Deliberately separate from fokuskeeper.py (stdlib only) -- this needs AppKit,
 which isn't guaranteed installed (see install.sh's headless fallback). Import
@@ -14,9 +15,12 @@ assuming one is already running.
 import AppKit
 import objc
 
+from fokuskeeper_icon import draw_app_icon
+
 WINDOW_WIDTH = 440
 CHECKBOX_ROW_HEIGHT = 22
 MARGIN = 20
+PERCENT_CHOICES = tuple(range(100, -1, -5))  # mirrors fokuskeeper.PROMPT_PERCENT_STEP
 
 
 class _SettingsDelegate(AppKit.NSObject):
@@ -43,14 +47,15 @@ class _SettingsDelegate(AppKit.NSObject):
 class SettingsPanel:
     """Builds and runs the settings window modally. Construct and call
     .run() -- returns "save" or "cancel"; on "save", read back
-    .enabled_keys(), .cooldown_text(), .quiet_text().
+    .enabled_keys(), .cooldown_text(), .quiet_text(), .percent_text().
     """
 
-    def __init__(self, targets, enabled_keys, cooldown_minutes, quiet_period_minutes):
+    def __init__(self, targets, enabled_keys, cooldown_minutes, quiet_period_minutes,
+                 prompt_percent=100):
         self.targets = targets
         self.result = "cancel"
         self._checkboxes = []
-        self._build(enabled_keys, cooldown_minutes, quiet_period_minutes)
+        self._build(enabled_keys, cooldown_minutes, quiet_period_minutes, prompt_percent)
 
     def _label(self, text, x, y, width, height, bold=False, wraps=False):
         field = AppKit.NSTextField.alloc().initWithFrame_(
@@ -99,7 +104,37 @@ class SettingsPanel:
         total_height = example_height + gap + field_height
         return field, [label, example], total_height
 
-    def _build(self, enabled_keys, cooldown_minutes, quiet_period_minutes):
+    def _percent_row(self, value, y, content_width):
+        """The "show prompt X% of the time" row: a popup of 0-100 in steps of
+        5 (so no free-text validation) with a wrapped explanation beside it
+        and an example line below. Same shape/return as _timer_field.
+        """
+        field_height = 26
+        label_height = 36
+        example_height = 28
+        gap = 4
+
+        popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            AppKit.NSMakeRect(MARGIN, y + example_height + gap, 80, field_height), False
+        )
+        popup.addItemsWithTitles_([f"{p}%" for p in PERCENT_CHOICES])
+        snapped = min(PERCENT_CHOICES, key=lambda p: abs(p - value))
+        popup.selectItemWithTitle_(f"{snapped}%")
+
+        label = self._label(
+            "Show the prompt this share of the times it would appear; the "
+            "rest are let through.",
+            MARGIN + 92, y + example_height + gap - 6,
+            content_width - 92, label_height, wraps=True,
+        )
+        example = self._label(
+            "Example: 50% means about half of would-be prompts are skipped "
+            "(they still start the cooldown and show in your stats).",
+            MARGIN, y, content_width, example_height, wraps=True,
+        )
+        return popup, [label, example], example_height + gap + field_height
+
+    def _build(self, enabled_keys, cooldown_minutes, quiet_period_minutes, prompt_percent):
         content_width = WINDOW_WIDTH - 2 * MARGIN
         extra_views = []
 
@@ -125,6 +160,11 @@ class SettingsPanel:
         cancel_button.setKeyEquivalent_("\x1b")  # Escape triggers Cancel
 
         y += button_row_height + MARGIN
+
+        # Prompt frequency section
+        self.percent_popup, views, height = self._percent_row(prompt_percent, y, content_width)
+        extra_views.extend(views)
+        y += height + MARGIN
 
         # Quiet period section
         self.quiet_field, views, height = self._timer_field(
@@ -185,6 +225,7 @@ class SettingsPanel:
             content.addSubview_(view)
         content.addSubview_(self.cooldown_field)
         content.addSubview_(self.quiet_field)
+        content.addSubview_(self.percent_popup)
         content.addSubview_(save_button)
         content.addSubview_(cancel_button)
 
@@ -199,6 +240,9 @@ class SettingsPanel:
     def run(self):
         app = AppKit.NSApplication.sharedApplication()
         app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyRegular)
+        # Regular policy puts this process in the Dock; without this it shows
+        # the generic executable icon instead of FokusKeeper's.
+        app.setApplicationIconImage_(draw_app_icon(512))
         app.activateIgnoringOtherApps_(True)
         self.window.makeKeyAndOrderFront_(None)
         app.runModalForWindow_(self.window)
@@ -214,13 +258,20 @@ class SettingsPanel:
     def quiet_text(self):
         return self.quiet_field.stringValue()
 
+    def percent_text(self):
+        return self.percent_popup.titleOfSelectedItem()
 
-def show_settings_panel(targets, enabled_keys, cooldown_minutes, quiet_period_minutes):
-    """Show the panel; returns (result, enabled_keys, cooldown_text, quiet_text).
+
+def show_settings_panel(targets, enabled_keys, cooldown_minutes, quiet_period_minutes,
+                        prompt_percent=100):
+    """Show the panel; returns (result, enabled_keys, cooldown_text,
+    quiet_text, percent_text).
 
     result is "save" or "cancel". On "cancel" the other values are the
     inputs unchanged -- the caller should not write anything.
     """
-    panel = SettingsPanel(targets, enabled_keys, cooldown_minutes, quiet_period_minutes)
+    panel = SettingsPanel(targets, enabled_keys, cooldown_minutes, quiet_period_minutes,
+                          prompt_percent)
     result = panel.run()
-    return result, panel.enabled_keys(), panel.cooldown_text(), panel.quiet_text()
+    return (result, panel.enabled_keys(), panel.cooldown_text(), panel.quiet_text(),
+            panel.percent_text())

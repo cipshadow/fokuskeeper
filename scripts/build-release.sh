@@ -67,6 +67,7 @@ export MACOSX_DEPLOYMENT_TARGET=13.0
   --name "$APP_NAME" \
   --target-architecture universal2 \
   --osx-bundle-identifier io.github.cipshadow.fokuskeeper \
+  --icon "$ROOT/assets/FokusKeeper.icns" \
   --distpath "$DIST_DIR" \
   --workpath "$BUILD_DIR/menubar-work" \
   --specpath "$BUILD_DIR/spec" \
