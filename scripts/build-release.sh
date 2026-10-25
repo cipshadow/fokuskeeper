@@ -94,7 +94,19 @@ STAGE="$BUILD_DIR/dmg-stage"
 mkdir -p "$STAGE"
 cp -R "$APP_PATH" "$STAGE/$APP_NAME.app"
 ln -s /Applications "$STAGE/Applications"
-hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG_PATH"
+# GitHub's macOS runners intermittently fail this with "Resource busy"
+# (a transient disk-image lock); retry a few times before giving up.
+for attempt in 1 2 3 4 5; do
+  if hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG_PATH"; then
+    break
+  fi
+  if [[ "$attempt" == 5 ]]; then
+    echo "hdiutil create failed after $attempt attempts" >&2
+    exit 1
+  fi
+  echo "hdiutil create failed (attempt $attempt); retrying in $((attempt * 5))s" >&2
+  sleep $((attempt * 5))
+done
 (cd "$DIST_DIR" && shasum -a 256 "$(basename "$DMG_PATH")" > "$(basename "$DMG_PATH").sha256")
 
 echo "Built and validated: $DMG_PATH"
