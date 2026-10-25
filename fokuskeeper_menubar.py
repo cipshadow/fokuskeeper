@@ -27,10 +27,21 @@ import AppKit
 import rumps
 import rumps.events  # not re-exported by rumps/__init__, so import it directly
 
-HERE = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    # The release build puts both independently frozen executables beside each
+    # other inside FokusKeeper.app. It does not need a source checkout, venv,
+    # or separately installed interpreter.
+    HERE = Path(sys.executable).resolve().parent
+    DAEMON_EXECUTABLE = HERE / "FokusKeeperDaemon"
+    DAEMON_PROCESS_PATTERN = "FokusKeeperDaemon.*run"
+else:
+    HERE = Path(__file__).resolve().parent
+    DAEMON_EXECUTABLE = None
+    DAEMON_PROCESS_PATTERN = "python.*fokuskeeper.py"
+
 DAEMON_SCRIPT = HERE / "fokuskeeper.py"
 AGENT_LABEL = "com.fokuskeeper.daemon"
-PROCESS_PATTERN = "python.*fokuskeeper.py"
+PROCESS_PATTERN = DAEMON_PROCESS_PATTERN
 LOCK_FILE = Path.home() / ".fokuskeeper-menubar.lock"
 DESIRED_STATE_FILE = Path.home() / ".fokuskeeper-desired-state"
 POLL_SECONDS = 5
@@ -134,7 +145,10 @@ def _resident_python():
 
 def start_daemon():
     """Start via launchd when available, else spawn directly."""
-    if agent_installed():
+    # Only source installs have ever used the legacy LaunchAgent. A packaged
+    # app must not revive one of those agents on upgrade because it points at
+    # an old source checkout and Python environment.
+    if not getattr(sys, "frozen", False) and agent_installed():
         result = subprocess.run(
             ["launchctl", "kickstart", agent_target()], capture_output=True, text=True
         )
@@ -143,8 +157,13 @@ def start_daemon():
 
     # No agent on this machine (or kickstart refused) — run it ourselves.
     # start_new_session detaches it so it outlives this menu bar app.
+    command = (
+        [str(DAEMON_EXECUTABLE), "run"]
+        if DAEMON_EXECUTABLE is not None
+        else [_resident_python(), "-u", str(DAEMON_SCRIPT), "run"]
+    )
     subprocess.Popen(
-        [_resident_python(), "-u", str(DAEMON_SCRIPT), "run"],
+        command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
