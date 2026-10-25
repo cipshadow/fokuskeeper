@@ -20,15 +20,15 @@ jobs:
       # runner architecture, which would make this public artifact single-arch.
       - name: Install universal2 Python
         env:
-          PYTHON_VERSION: 3.12.11
+          PYTHON_VERSION: 3.13.11
         run: |
           curl --fail --location --retry 3 --output python.pkg \
             "https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-macos11.pkg"
           sudo installer -pkg python.pkg -target /
-          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 --version
+          /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 --version
       - name: Build universal release
         env:
-          PYTHON: /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+          PYTHON: /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
         run: ./scripts/build-release.sh
       - name: Upload release artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
