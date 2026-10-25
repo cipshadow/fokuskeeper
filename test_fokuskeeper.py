@@ -483,18 +483,39 @@ class TestUrlMatching(_HermeticConfigMixin):
 
 
 class TestGatePrecedence(_TempStateMixin):
-    """evaluate_gate(): COOLDOWN > FIRST_OPEN > QUIET > PROMPT."""
+    """evaluate_gate(): COOLDOWN > FIRST_OPEN > QUIET > SKIPPED > PROMPT."""
 
-    def _gate(self, state):
-        patches = self._patches()
+    def _gate(self, state, percent=100, roll=None):
+        patches = self._patches() + [patch.object(sg, "prompt_percent", return_value=percent)]
         for p in patches:
             p.start()
         try:
             sg.save_state(state)
-            return sg.evaluate_gate(sg.TARGETS_BY_KEY["slack"])
+            return sg.evaluate_gate(sg.TARGETS_BY_KEY["slack"], roll=roll)
         finally:
             for p in patches:
                 p.stop()
+
+    def _would_prompt_state(self):
+        return {
+            "stats_date": sg.get_today_date(),
+            "slack_opens": 3,
+            "slack_last_seen": datetime.now().isoformat(),
+        }
+
+    def test_100_percent_always_prompts(self):
+        assert self._gate(self._would_prompt_state(), percent=100, roll=99.99) is sg.Gate.PROMPT
+
+    def test_0_percent_never_prompts(self):
+        assert self._gate(self._would_prompt_state(), percent=0, roll=0.0) is sg.Gate.SKIPPED
+
+    def test_50_percent_splits_on_roll(self):
+        assert self._gate(self._would_prompt_state(), percent=50, roll=49.9) is sg.Gate.PROMPT
+        assert self._gate(self._would_prompt_state(), percent=50, roll=50.0) is sg.Gate.SKIPPED
+
+    def test_percent_never_overrides_first_open(self):
+        # 0% only affects would-be prompts; the earlier auto-allows win.
+        assert self._gate({}, percent=0, roll=0.0) is sg.Gate.FIRST_OPEN
 
     def test_cooldown_beats_first_open_and_quiet(self):
         # opens == 0 (would be FIRST_OPEN) and never seen (would be QUIET),
@@ -1081,7 +1102,7 @@ class TestCmdSettings(_TempConfigMixin):
     """cmd_settings(): the panel path and its headless (no AppKit) fallback."""
 
     def _run_settings_with_panel(self, panel_return):
-        """panel_return: (result, enabled_keys, cooldown_text, quiet_text)."""
+        """panel_return: (result, enabled_keys, cooldown_text, quiet_text, percent_text)."""
         fake_module = MagicMock()
         fake_module.show_settings_panel = MagicMock(return_value=panel_return)
         patches = self._patches()
@@ -1095,20 +1116,22 @@ class TestCmdSettings(_TempConfigMixin):
                 p.stop()
 
     def test_save_writes_enabled_and_timing_together(self):
-        self._run_settings_with_panel(("save", ["reddit", "gmail"], "10", "90"))
+        self._run_settings_with_panel(("save", ["reddit", "gmail"], "10", "90", "50%"))
         assert json.loads(self.config_file.read_text()) == {
             "enabled": ["reddit", "gmail"], "cooldown_minutes": 10, "quiet_period_minutes": 90,
+            "prompt_percent": 50,
         }
 
     def test_cancel_writes_nothing(self):
-        self._run_settings_with_panel(("cancel", ["reddit"], "10", "90"))
+        self._run_settings_with_panel(("cancel", ["reddit"], "10", "90", "50%"))
         assert not self.config_file.exists()
 
     def test_invalid_timing_text_falls_back_to_current_value(self):
         self.config_file.write_text(json.dumps({"cooldown_minutes": 3, "quiet_period_minutes": 60}))
-        self._run_settings_with_panel(("save", ["slack"], "not a number", "90"))
+        self._run_settings_with_panel(("save", ["slack"], "not a number", "90", "abc"))
         assert json.loads(self.config_file.read_text()) == {
             "enabled": ["slack"], "cooldown_minutes": 3, "quiet_period_minutes": 90,
+            "prompt_percent": 100,
         }
 
     def test_no_appkit_falls_back_to_sequential_dialogs(self):
@@ -1960,3 +1983,48 @@ class TestTimesavedCommand(_TempCliMixin):
         out = capsys.readouterr().out
         assert "Time saved (modeled, not measured)" in out
         assert out.count("No attempts recorded") == 2
+
+
+class TestPromptPercent(_TempConfigMixin):
+    """prompt_percent(): config parsing and the SKIPPED intercept path."""
+
+    def _percent(self, raw):
+        self.config_file.write_text(json.dumps({"prompt_percent": raw}))
+        with patch.object(sg, "CONFIG_FILE", self.config_file):
+            return sg.prompt_percent()
+
+    def test_default_is_100_when_absent(self):
+        with patch.object(sg, "CONFIG_FILE", self.config_file):
+            assert sg.prompt_percent() == 100
+
+    def test_zero_is_valid(self):
+        assert self._percent(0) == 0
+
+    def test_snaps_to_step_of_5(self):
+        assert self._percent(52) == 50
+
+    def test_out_of_range_falls_back(self):
+        assert self._percent(150) == 100
+        assert self._percent(-5) == 100
+
+    def test_skipped_counts_as_allowed_open_with_reason(self):
+        target = sg.TARGETS_BY_KEY["slack"]
+        surface = MagicMock()
+        with patch.object(sg, "evaluate_gate", return_value=sg.Gate.SKIPPED), \
+             patch.object(sg, "increment_daily_count", return_value=2) as inc, \
+             patch.object(sg, "allow_access") as allow, \
+             patch.object(sg, "log"):
+            assert sg.handle_intercept(target, surface) is True
+        inc.assert_called_once_with("slack", reason=sg.REASON_PROMPT_SKIPPED)
+        allow.assert_called_once_with("slack")
+        surface.block.assert_not_called()
+
+    def test_skipped_reason_counts_as_auto_allowed_in_stats(self):
+        history = [{"date": "2026-10-25", "time": "10:00:00", "type": "slack_opened",
+                    "reason": sg.REASON_PROMPT_SKIPPED}]
+        classified = sg.classify_history(history, 60)
+        model = {"minutes_saved_per_block": 10, "minutes_cost_per_reasoned_open": 1,
+                 "workday_hours": 8}
+        summary = sg.summarize_time_saved(classified, model)
+        assert summary["auto_allowed"] == 1
+        assert summary["reasoned"] == 0

@@ -27,6 +27,8 @@ import AppKit
 import rumps
 import rumps.events  # not re-exported by rumps/__init__, so import it directly
 
+from fokuskeeper_icon import draw_shield_k
+
 if getattr(sys, "frozen", False):
     # The release build puts both independently frozen executables beside each
     # other inside FokusKeeper.app. It does not need a source checkout, venv,
@@ -44,73 +46,25 @@ AGENT_LABEL = "com.fokuskeeper.daemon"
 PROCESS_PATTERN = DAEMON_PROCESS_PATTERN
 LOCK_FILE = Path.home() / ".fokuskeeper-menubar.lock"
 DESIRED_STATE_FILE = Path.home() / ".fokuskeeper-desired-state"
+MENUBAR_LOG = Path.home() / "Library" / "Logs" / "fokuskeeper-menubar.log"
 POLL_SECONDS = 5
 
-ICON_BASE_SYMBOLS = ("shield.fill", "shield.lefthalf.filled", "shield")
 ICON_POINT_SIZE = 18
 ICON_OFF_FRACTION = 0.4  # dims the shield when stopped; the K cutout stays crisp
-
-FALLBACK_TITLE_ON = "🛡️"
-FALLBACK_TITLE_OFF = "🛡️⏸"
 
 _lock_handle = None
 _shield_k_cache = {}
 
 
 def _shield_k_image(on):
-    """A shield with a 'K' cut out of it, cached per on/off state.
-
-    No SF Symbol combines a shield with an arbitrary letter, so this
-    composites one: draw the shield glyph solid, then punch the K through it
-    with a destination-out blend — the same cutout technique Apple's own
-    compound shield symbols use (e.g. shield.lefthalf.filled's two-tone
-    split). Returns None if no shield symbol resolves at all, so the caller
-    can fall back to the plain-text title.
-    """
-    if on in _shield_k_cache:
-        return _shield_k_cache[on]
-
-    base = None
-    for name in ICON_BASE_SYMBOLS:
-        base = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            name, "FokusKeeper"
-        )
-        if base is not None:
-            break
-    if base is None:
-        _shield_k_cache[on] = None
-        return None
-
-    size = ICON_POINT_SIZE
-    image = AppKit.NSImage.alloc().initWithSize_((size, size))
-    image.lockFocus()
-
-    rect = AppKit.NSMakeRect(0, 0, size, size)
-    base.drawInRect_fromRect_operation_fraction_(
-        rect, AppKit.NSZeroRect, AppKit.NSCompositingOperationSourceOver,
-        1.0 if on else ICON_OFF_FRACTION,
-    )
-
-    font = AppKit.NSFont.boldSystemFontOfSize_(size * 0.62)
-    attrs = {
-        AppKit.NSFontAttributeName: font,
-        AppKit.NSForegroundColorAttributeName: AppKit.NSColor.blackColor(),
-    }
-    text = AppKit.NSAttributedString.alloc().initWithString_attributes_("K", attrs)
-    text_size = text.size()
-    x = (size - text_size.width) / 2.0 - 2  # nudge left: the K's diagonal strokes read visually off-center otherwise
-    y = (size - text_size.height) / 2.0 + size * 0.02  # nudge up: the shield's pointed tip reads as dead weight below center
-
-    ctx = AppKit.NSGraphicsContext.currentContext()
-    ctx.saveGraphicsState()
-    ctx.setCompositingOperation_(AppKit.NSCompositingOperationDestinationOut)
-    text.drawAtPoint_((x, y))
-    ctx.restoreGraphicsState()
-
-    image.unlockFocus()
-    image.setTemplate_(True)
-    _shield_k_cache[on] = image
-    return image
+    """The menu bar's shield-with-K, cached per on/off state. Drawn by
+    fokuskeeper_icon (the same drawing as the app icon) and marked as a
+    template so macOS tints it for light/dark menu bars."""
+    if on not in _shield_k_cache:
+        image = draw_shield_k(ICON_POINT_SIZE, 1.0 if on else ICON_OFF_FRACTION)
+        image.setTemplate_(True)
+        _shield_k_cache[on] = image
+    return _shield_k_cache[on]
 
 
 def is_running():
@@ -178,7 +132,30 @@ def open_settings(_sender=None):
     system dialog already blocks everything else the user could do in the
     meantime.
     """
-    subprocess.run([_resident_python(), str(DAEMON_SCRIPT), "settings"])
+    command = (
+        [str(DAEMON_EXECUTABLE), "settings"]
+        if DAEMON_EXECUTABLE is not None
+        else [_resident_python(), str(DAEMON_SCRIPT), "settings"]
+    )
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+    except OSError as exc:
+        _log_error(f"Settings could not start ({command[0]}): {exc}")
+        return
+    if result.returncode != 0:
+        _log_error(
+            f"Settings exited {result.returncode}: {result.stderr.strip()[-500:]}"
+        )
+
+
+def _log_error(message):
+    """Append to the menu bar log; a packaged app has no shell redirect, so
+    without this a failing Settings click leaves no trace anywhere."""
+    try:
+        with open(MENUBAR_LOG, "a") as handle:
+            handle.write(f"[menubar] {message}\n")
+    except OSError:
+        pass
 
 
 def stop_daemon():
@@ -217,7 +194,7 @@ def set_desired_running(value):
 
 class FokusKeeperStatusApp(rumps.App):
     def __init__(self):
-        super().__init__("FokusKeeper", title=FALLBACK_TITLE_OFF, quit_button="Quit")
+        super().__init__("FokusKeeper", title="", quit_button="Quit")
         self.on = False
 
         self.toggle_item = rumps.MenuItem("Start FokusKeeper", callback=self.toggle)
@@ -268,18 +245,8 @@ class FokusKeeperStatusApp(rumps.App):
         if item is None:
             return
 
-        try:
-            image = _shield_k_image(self.on)
-        except AttributeError:
-            image = None
-
-        if image is None:
-            item.setImage_(None)
-            item.setTitle_(FALLBACK_TITLE_ON if self.on else FALLBACK_TITLE_OFF)
-            return
-
         item.setTitle_("")
-        item.setImage_(image)
+        item.setImage_(_shield_k_image(self.on))
 
     def toggle(self, _sender):
         if self.on:
