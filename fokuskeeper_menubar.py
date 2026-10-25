@@ -30,11 +30,12 @@ import rumps.events  # not re-exported by rumps/__init__, so import it directly
 from fokuskeeper_icon import draw_shield_k
 
 if getattr(sys, "frozen", False):
-    # The release build puts both independently frozen executables beside each
-    # other inside FokusKeeper.app. It does not need a source checkout, venv,
-    # or separately installed interpreter.
+    # The release build puts the independently frozen daemon (a PyInstaller
+    # onedir folder) in Contents/Resources/daemon/ of FokusKeeper.app; see
+    # scripts/build-release.sh. It does not need a source checkout, venv, or
+    # separately installed interpreter.
     HERE = Path(sys.executable).resolve().parent
-    DAEMON_EXECUTABLE = HERE / "FokusKeeperDaemon"
+    DAEMON_EXECUTABLE = HERE.parent / "Resources" / "daemon" / "FokusKeeperDaemon"
     DAEMON_PROCESS_PATTERN = "FokusKeeperDaemon.*run"
 else:
     HERE = Path(__file__).resolve().parent
@@ -172,8 +173,9 @@ def reap_settings():
 
 
 def _focus_settings_window(pid):
-    """Activate the Settings process. A frozen onefile build runs the window
-    in a child of `pid`, so activate every process whose parent is `pid` too."""
+    """Activate the Settings process. A PyInstaller onefile build (older
+    releases) ran the window in a child of `pid`, so activate every process
+    whose parent is `pid` too; for the current onedir build that's a no-op."""
     pids = {pid}
     result = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
     pids.update(int(p) for p in result.stdout.split() if p.isdigit())

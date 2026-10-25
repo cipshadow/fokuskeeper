@@ -52,9 +52,11 @@ require_universal "$($PYTHON -c 'import sys; print(sys.executable)')"
 export MACOSX_DEPLOYMENT_TARGET=13.0
 
 # The daemon is a separate frozen executable. The menu-bar executable launches
-# it by the sibling path inside the app bundle, leaving no Python runtime or
-# source files required after installation.
-"$PYTHON" -m PyInstaller --noconfirm --clean --onefile \
+# it from Contents/Resources/daemon/ inside the app bundle, leaving no Python
+# runtime or source files required after installation. --onedir, not
+# --onefile: a onefile build unpacks ~16 MB into a fresh temp folder on every
+# launch, which made each Settings click take ~3 s before the window showed.
+"$PYTHON" -m PyInstaller --noconfirm --clean --onedir \
   --name FokusKeeperDaemon \
   --target-architecture universal2 \
   --hidden-import fokuskeeper_settings_panel \
@@ -73,8 +75,12 @@ export MACOSX_DEPLOYMENT_TARGET=13.0
   --specpath "$BUILD_DIR/spec" \
   "$ROOT/fokuskeeper_menubar.py"
 
-cp "$BUILD_DIR/daemon-dist/FokusKeeperDaemon" "$APP_PATH/Contents/MacOS/FokusKeeperDaemon"
-chmod +x "$APP_PATH/Contents/MacOS/FokusKeeperDaemon"
+# Resources, not MacOS: the onedir build is a folder holding data files as
+# well as code, and Contents/MacOS must contain only signed code.
+DAEMON_DIR="$APP_PATH/Contents/Resources/daemon"
+rm -rf "$DAEMON_DIR"
+cp -R "$BUILD_DIR/daemon-dist/FokusKeeperDaemon" "$DAEMON_DIR"
+chmod +x "$DAEMON_DIR/FokusKeeperDaemon"
 /usr/libexec/PlistBuddy -c 'Add :LSMinimumSystemVersion string 13.0' \
   "$APP_PATH/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :LSUIElement bool true' \
