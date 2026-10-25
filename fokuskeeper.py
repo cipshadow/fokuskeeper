@@ -19,9 +19,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 # Configuration
-# pgrep/pkill pattern for the daemon process. Deliberately `python.*` + script
-# name so an editor session with the file open never matches.
-DAEMON_PROCESS_PATTERN = "python.*fokuskeeper.py"
+# Development runs the daemon with Python; the public app ships it as its own
+# frozen executable. Keeping the patterns distinct prevents false matches.
+DAEMON_PROCESS_PATTERN = (
+    "FokusKeeperDaemon.*run"
+    if getattr(sys, "frozen", False)
+    else "python.*fokuskeeper.py"
+)
 # Timeouts so a hung osascript (e.g. a pending TCC prompt) can't freeze the
 # single-threaded monitor loop forever. Dialogs legitimately wait on a human,
 # so they get a much longer budget.
