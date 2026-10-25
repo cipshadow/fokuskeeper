@@ -13,6 +13,8 @@ echo ""
 # another account's FokusKeeper too.
 pkill -f -u "$(id -u)" 'python.*fokuskeeper.py' 2>/dev/null || true
 pkill -f -u "$(id -u)" 'python.*fokuskeeper_menubar.py' 2>/dev/null || true
+pkill -f -u "$(id -u)" 'FokusKeeperDaemon.*run' 2>/dev/null || true
+pkill -f -u "$(id -u)" 'FokusKeeper.app/Contents/MacOS/FokusKeeper' 2>/dev/null || true
 echo "Stopped daemon and menu bar (if they were running)."
 
 remove_path() {
@@ -23,6 +25,7 @@ remove_path() {
 }
 
 remove_path "$HOME/Applications/FokusKeeper.app"
+remove_path "/Applications/FokusKeeper.app"
 remove_path "$HOME/Desktop/FOKUSKEEPER.command"
 
 if [ "$1" = "--purge" ]; then

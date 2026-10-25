@@ -6,6 +6,7 @@ __pycache__/
 .fokuskeeper-*.json
 .slack-gatekeeper-*.json
 FokusKeeper.app/
+build/
+dist/
 *.command
-!FokusKeeper-Install.command
 nohup.out

@@ -1,0 +1,2 @@
+# Dependencies required only to build a distributable macOS app.
+pyinstaller==6.19.0
