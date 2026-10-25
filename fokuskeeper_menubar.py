@@ -44,6 +44,7 @@ AGENT_LABEL = "com.fokuskeeper.daemon"
 PROCESS_PATTERN = DAEMON_PROCESS_PATTERN
 LOCK_FILE = Path.home() / ".fokuskeeper-menubar.lock"
 DESIRED_STATE_FILE = Path.home() / ".fokuskeeper-desired-state"
+MENUBAR_LOG = Path.home() / "Library" / "Logs" / "fokuskeeper-menubar.log"
 POLL_SECONDS = 5
 
 ICON_BASE_SYMBOLS = ("shield.fill", "shield.lefthalf.filled", "shield")
@@ -178,7 +179,30 @@ def open_settings(_sender=None):
     system dialog already blocks everything else the user could do in the
     meantime.
     """
-    subprocess.run([_resident_python(), str(DAEMON_SCRIPT), "settings"])
+    command = (
+        [str(DAEMON_EXECUTABLE), "settings"]
+        if DAEMON_EXECUTABLE is not None
+        else [_resident_python(), str(DAEMON_SCRIPT), "settings"]
+    )
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+    except OSError as exc:
+        _log_error(f"Settings could not start ({command[0]}): {exc}")
+        return
+    if result.returncode != 0:
+        _log_error(
+            f"Settings exited {result.returncode}: {result.stderr.strip()[-500:]}"
+        )
+
+
+def _log_error(message):
+    """Append to the menu bar log; a packaged app has no shell redirect, so
+    without this a failing Settings click leaves no trace anywhere."""
+    try:
+        with open(MENUBAR_LOG, "a") as handle:
+            handle.write(f"[menubar] {message}\n")
+    except OSError:
+        pass
 
 
 def stop_daemon():
