@@ -15,8 +15,6 @@ assuming one is already running.
 import AppKit
 import objc
 
-from fokuskeeper_icon import draw_app_icon
-
 WINDOW_WIDTH = 440
 CHECKBOX_ROW_HEIGHT = 22
 MARGIN = 20
@@ -42,6 +40,15 @@ class _SettingsDelegate(AppKit.NSObject):
     def cancel_(self, _sender):
         self.panel.result = "cancel"
         AppKit.NSApp.stopModal()
+
+    def windowWillClose_(self, _notification):
+        # The title-bar close button closes the window but, unlike
+        # Save/Cancel, never ends runModalForWindow_ on its own -- the process
+        # then lives on with no window, and the menu bar used to wait on it
+        # forever. Treat it as Cancel. Harmless after Save/Cancel, since
+        # run() closes the window once the modal loop has already stopped.
+        if AppKit.NSApp.modalWindow() is not None:
+            self.cancel_(None)
 
 
 class SettingsPanel:
@@ -234,15 +241,17 @@ class SettingsPanel:
         save_button.setAction_("save:")
         cancel_button.setTarget_(self._delegate)
         cancel_button.setAction_("cancel:")
+        window.setDelegate_(self._delegate)
 
         self.window = window
 
     def run(self):
         app = AppKit.NSApplication.sharedApplication()
-        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyRegular)
-        # Regular policy puts this process in the Dock; without this it shows
-        # the generic executable icon instead of FokusKeeper's.
-        app.setApplicationIconImage_(draw_app_icon(512))
+        # Accessory: the window can take focus and typing, but the process
+        # never appears in the Dock or the app switcher (Regular did both,
+        # with a generic Python icon). runModalForWindow_ raises the window
+        # to modal-panel level, above other apps' windows.
+        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
         app.activateIgnoringOtherApps_(True)
         self.window.makeKeyAndOrderFront_(None)
         app.runModalForWindow_(self.window)
