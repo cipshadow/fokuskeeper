@@ -30,11 +30,12 @@ import rumps.events  # not re-exported by rumps/__init__, so import it directly
 from fokuskeeper_icon import draw_shield_k
 
 if getattr(sys, "frozen", False):
-    # The release build puts both independently frozen executables beside each
-    # other inside FokusKeeper.app. It does not need a source checkout, venv,
-    # or separately installed interpreter.
+    # The release build puts the independently frozen daemon (a PyInstaller
+    # onedir folder) in Contents/Resources/daemon/ of FokusKeeper.app; see
+    # scripts/build-release.sh. It does not need a source checkout, venv, or
+    # separately installed interpreter.
     HERE = Path(sys.executable).resolve().parent
-    DAEMON_EXECUTABLE = HERE / "FokusKeeperDaemon"
+    DAEMON_EXECUTABLE = HERE.parent / "Resources" / "daemon" / "FokusKeeperDaemon"
     DAEMON_PROCESS_PATTERN = "FokusKeeperDaemon.*run"
 else:
     HERE = Path(__file__).resolve().parent
@@ -124,28 +125,64 @@ def start_daemon():
     )
 
 
+_settings_proc = None
+
+
 def open_settings(_sender=None):
-    """Re-run the combined settings flow (same as `fokuskeeper settings`):
-    app chooser, then cooldown, then quiet-period -- no separate settings UI
-    to keep in sync. Runs in the foreground and blocks the menu bar app's
-    own event loop while the dialogs are up; that's fine, since a modal
-    system dialog already blocks everything else the user could do in the
-    meantime.
+    """Open the combined settings window (same as `fokuskeeper settings`) in
+    its own process, without waiting for it: the menu bar keeps running
+    while the window is up. A window left open used to freeze the icon,
+    highlighted, until it closed. A second click while one is already open
+    brings that window forward instead of opening another.
     """
+    global _settings_proc
+    if _settings_proc is not None and _settings_proc.poll() is None:
+        _focus_settings_window(_settings_proc.pid)
+        return
+
     command = (
         [str(DAEMON_EXECUTABLE), "settings"]
         if DAEMON_EXECUTABLE is not None
         else [_resident_python(), str(DAEMON_SCRIPT), "settings"]
     )
     try:
-        result = subprocess.run(command, capture_output=True, text=True)
+        stderr = open(MENUBAR_LOG, "a")
+    except OSError:
+        stderr = subprocess.DEVNULL
+    try:
+        _settings_proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
     except OSError as exc:
         _log_error(f"Settings could not start ({command[0]}): {exc}")
+    finally:
+        if stderr is not subprocess.DEVNULL:
+            stderr.close()  # the child keeps its own copy of the descriptor
+
+
+def reap_settings():
+    """Called every tick: log a Settings process that exited with an error
+    (its stderr already went to MENUBAR_LOG) and clear it."""
+    global _settings_proc
+    if _settings_proc is None:
         return
-    if result.returncode != 0:
-        _log_error(
-            f"Settings exited {result.returncode}: {result.stderr.strip()[-500:]}"
-        )
+    returncode = _settings_proc.poll()
+    if returncode is None:
+        return
+    if returncode != 0:
+        _log_error(f"Settings exited {returncode}")
+    _settings_proc = None
+
+
+def _focus_settings_window(pid):
+    """Activate the Settings process. A PyInstaller onefile build (older
+    releases) ran the window in a child of `pid`, so activate every process
+    whose parent is `pid` too; for the current onedir build that's a no-op."""
+    pids = {pid}
+    result = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
+    pids.update(int(p) for p in result.stdout.split() if p.isdigit())
+    for each in pids:
+        app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(each)
+        if app is not None:
+            app.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
 
 
 def _log_error(message):
@@ -258,6 +295,7 @@ class FokusKeeperStatusApp(rumps.App):
         self.tick(None)
 
     def tick(self, _sender):
+        reap_settings()
         self.on = is_running()
         self.toggle_item.title = "Stop FokusKeeper" if self.on else "Start FokusKeeper"
         self.apply_icon()
