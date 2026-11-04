@@ -10,3 +10,15 @@ build/
 dist/
 *.command
 nohup.out
+
+# Agent/session files and local secrets — never commit
+SESSION_LOG*
+.session-handoff.md
+CLAUDE.local.md
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.cursor/
+NOTES.local.md
